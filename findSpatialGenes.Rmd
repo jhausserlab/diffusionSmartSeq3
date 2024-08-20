@@ -1,0 +1,2881 @@
+---
+title: find spatial genes- to 2nd order
+output: html_render
+---
+
+# Setup
+```{r}
+rm(list=ls())
+# setwd("/scratch/jean.hausser/spatialSmartSeq3")
+library(tidyverse)
+library(ggrepel)
+
+library(plotly)
+
+library(princurve)
+library(umap)
+library(ade4)
+library(fdrtool)
+library(calculus)
+library(furrr)
+plan(multisession, workers = 25)
+library(gprofiler2)
+library(XICOR)
+```
+
+
+## Load pathway data
+```{r}
+readGmt = function(filename="gprofiler_hsapiens.name/hsapiens.REAC.name.gmt", forceReload=F) {
+  rdsFilename = str_replace(filename, ".gmt$", ".gmt.rds")
+  if ( !forceReload & file.exists(rdsFilename) ) {
+    return(read_rds(rdsFilename))
+  }
+    
+  geneSets = read_tsv(filename, col_names = F) %>% 
+    filter(!str_detect(X2, " root term$"))
+  idNames = geneSets[, 1:2]
+  colnames(idNames) = c("id", "description")
+  idGeneVs = lapply(1:nrow(geneSets), function(i) { 
+    geneVec = unlist(geneSets[i,-c(1,2)])
+    geneVec = geneVec[!is.na(geneVec)]
+    return(geneVec)
+  })
+  names(idGeneVs) = idNames %>% pull(id)
+  myObj = list(idNames=idNames, geneLists=idGeneVs)
+  write_rds(myObj, file=rdsFilename)
+  return(myObj)
+}
+REAC = readGmt()
+WP = readGmt("gprofiler_hsapiens.name/hsapiens.WP.name.gmt")
+CORUM = readGmt("gprofiler_hsapiens.name/hsapiens.CORUM.name.gmt")
+
+DBobjs=list(REAC, WP, CORUM)
+nMinGenes=5
+
+myID = "REAC:R-HSA-9796292"
+
+DBobj = list()
+DBobj$geneLists = list()
+for (i in 1:length(DBobjs)) {
+  DBobj$geneLists = c(DBobj$geneLists, DBobjs[[i]]$geneLists)
+}
+DBobj$idNames = map(DBobjs, function(x) { x$idNames }) %>% bind_rows
+length(DBobj$geneLists)
+
+# Add KEGG pathways we need
+KEGGidNames = 
+  tibble(id=c("KEGG:04140",
+              "KEGG:04350",
+              "KEGG:04218",
+              "KEGG:04668",
+              "KEGG:04714",
+              "KEGG:05208"
+              ),
+         description=c(
+           "Autophagy",
+           "TGF-beta signaling",
+           "cellular senescence",
+           "TNF signaling",
+           "Thermogenesis",
+           "Chemical carcinogenesis - reactive oxygen species"
+         ))
+DBobj$idNames = bind_rows(DBobj$idNames, KEGGidNames)
+
+myKEGG = "KEGG:04140"
+for (myKEGG in KEGGidNames %>% pull(id)) {
+  myTSV = read_tsv(sprintf("KEGG/%s.tsv", myKEGG), col_names=F)
+  tGenes = myTSV %>% 
+    separate(X2, into=c("gene", "description"), sep = "; ") %>% 
+    pull(gene) %>% unique
+  DBobj$geneLists[[myKEGG]] = tGenes
+  # DBobj$geneLists = c(DBobj$geneLists, tGenes)
+  # names(DBobj$geneLists)[length(DBobj$geneLists)] = myKEGG
+}
+length(DBobj$geneLists)
+rm(DBobjs)
+```
+
+# Load SmartSeq3 data
+```{r}
+# allCounts = read_tsv("countMatrix.tsv")
+# write_rds(allCounts, "allCounts.rds")
+allCounts = read_rds("allCounts.rds")
+allCounts[1:5,1:5]
+dim(allCounts)
+allGeneNames = allCounts %>% pull("GeneID")
+nUMIsPerGene = apply(allCounts %>% select(-GeneID), 1, sum) #UMIs per gene
+sum(nUMIsPerGene == 0)
+nCells = ncol(allCounts)
+nUMIsPerCell = apply(allCounts %>% select(-GeneID), 2, sum) #UMIs per cell
+median(nUMIsPerCell)
+
+allCountsMat = as.matrix(allCounts %>% select(-GeneID)) %>% t
+colnames(allCountsMat) = allCounts %>% pull(GeneID)
+rm(allCounts)
+
+log10(nUMIsPerGene / nCells) %>% hist(300)
+log10(nUMIsPerCell) %>% hist(100)
+```
+
+Dropping genes with less than one UMI per cell could be appropriate (distribution tail)
+
+```{r}
+nUMIsPerGene[1:10]/nCells
+#The fourth gene has ~1 UMI per cell. Let's see if its distribution could be Poissonian (overdispersed is ok: gene regulation, UMI content)
+geneIdx = 4
+myBins = seq(0, max(allCountsMat[,geneIdx]), by=1)
+hist(allCountsMat[,geneIdx], myBins)
+plot(myBins, dpois(myBins, mean(allCountsMat[,geneIdx])) * nCells)
+
+var(allCountsMat[,geneIdx]) / mean(allCountsMat[,geneIdx]) #the counts are strongly over-dispersed
+```
+
+# Load FACS data
+
+FITC-A == Calcein
+PE_CY5 == Vybrant_DIL
+
+```{r}
+
+FACS = read_csv("FACS_bc.csv") %>% 
+  filter(Experiment == "MDA_SS_3D") %>% 
+  filter(`PE.Cy5..YG..A`>0, `FITC.A`>0) %>%
+  mutate(vybrantDil=log10(`PE.Cy5..YG..A`)) %>% 
+  mutate(calcein=log10(`FITC.A`)) %>% 
+  select(Experiment, vybrantDil, calcein, barcode)
+
+myPC = principal_curve(FACS %>% select(calcein, vybrantDil) %>% as.matrix, stretch=100)
+FACS = FACS %>% 
+  # mutate(radialPosition=1 - (myPC$lambda - min(myPC$lambda)) / diff(range(myPC$lambda))) %>% 
+  mutate(radialPosition=(calcein - min(calcein)) / diff(range(calcein)))
+
+ggplot(FACS, aes(x=calcein, y=vybrantDil)) +
+  geom_point(alpha=.5) +
+  geom_density2d()
+
+ggplot(FACS , aes(y=calcein, x=vybrantDil)) +
+  geom_point(aes(col=radialPosition)) +
+  geom_density2d() +
+  # geom_path(data=myPC$s[order(myPC$lambda),] %>% as_tibble(), col="red") +
+  labs(y="Calcein-AM (log10)", x="Vybrant-DiL (log10)")
+ggsave("calceinVsVybrantPCfit.pdf", height=3, width=4.5)
+
+h = FACS %>% pull(radialPosition) %>% hist(50)
+
+maxRthresh = .75
+#maxRthresh = 1
+plot(h$breaks[-1], h$counts)
+rc = tibble(r=h$breaks[-1], nCells=h$counts)
+rcSS = rc %>% filter(r<maxRthresh) %>% as.matrix
+SSmat = ( t(rcSS) %*% rcSS ) / nrow(rcSS)
+eigen(SSmat)$values
+firstEV = eigen(SSmat)$vectors[,1]
+slope = firstEV[2]/firstEV[1]
+#show linearity
+rcFit = rc %>% filter(r<maxRthresh) %>% mutate(r2=r^2)
+lm1 = lm(nCells~r2 + 0, data=rcFit)
+rcFit = rcFit %>% mutate(predn=predict(lm1, rcFit))
+ggplot(rc, aes(x=r, y=nCells)) + 
+  geom_point() + 
+  geom_errorbar(aes(ymin=nCells-1.96*sqrt(nCells),
+                    ymax=nCells+1.96*sqrt(nCells))) +
+  # geom_abline(intercept=0, slope=slope) +
+  geom_line(aes(y=predn), color="red", data=rcFit) +
+  geom_vline(xintercept = maxRthresh, linetype=2) +
+  labs(x="radial position", y="number of cells")
+
+ggsave("nCellsVsRadialPosition.pdf", height=3, width=4)
+```
+
+# Keep only 3D experiment
+```{r}
+# counts %>% as.data.frame %>% 
+#   rownames_to_column("barcode") %>% .[1:5,]
+maxRthresh = 1
+
+cf = inner_join(FACS %>% 
+                  filter(radialPosition<=maxRthresh), #counts-FACS table, eliminate cells that are presumably oustide spheroids
+                allCountsMat %>% as.data.frame %>% 
+                  rownames_to_column("barcode") %>% 
+                  mutate(nUMIsPerCell=nUMIsPerCell), 
+                by="barcode")
+dim(cf)
+# cf %>% ggplot(aes(x=radialPosition)) + geom_histogram(bins=20)
+cf %>% head
+geneNames = colnames(cf)[(ncol(FACS)+1):(ncol(FACS)+length(nUMIsPerGene))] 
+
+rm(allCountsMat,h,myPC,rc,rcSS,SSmat)
+
+nUMIsPerCell = apply(cf[,geneNames], 1, sum)
+names(nUMIsPerCell) = cf %>% pull(barcode)
+nUMIsPerCell[1:5]
+nUMIsPerGene = apply(cf[,geneNames], 2, sum)
+nUMIsPerGene[1:5]
+nCells = nrow(cf)
+
+#find a gene with reasonably high expression
+hist(log10(nUMIsPerGene), 200)
+
+fEst=(1+nUMIsPerGene) / sum(nUMIsPerGene)
+tibble(fEst=fEst) %>% 
+  filter(fEst>1e-7) %>% 
+  ggplot(aes(y=fEst)) +
+  geom_histogram(bins=300) + 
+  scale_y_log10() +
+  labs(x="number of genes", y="fractional abundance")
+
+mynUMIs = c(6000, 120e3)
+log10(1/mynUMIs)
+map(mynUMIs, function(n) { mean( fEst > 1/n ) }) #10x
+
+100 * (1 - ecdf(fEst)(1/mynUMIs))
+
+tibble(fEst=fEst) %>%
+  ggplot() +
+  geom_line(aes(x=fEst, y = 100 * (1 - ..y..)), stat='ecdf') +
+  scale_x_log10() +
+  coord_cartesian(xlim=c(1e-6, 1e-3), ylim=c(0,60)) +
+  geom_vline(aes(xintercept=x), data=tibble(x=1/mynUMIs)) +
+  labs(x="fractional abundance of mRNA", y="% of genes with at least this abundance")
+ggsave("seqDepth_SS3_vs_10x.pdf", height=3.5, width=4)
+
+```
+
+Fit a + br + cr^2
+
+```{r}
+myGene = geneNames[which(log10(nUMIsPerGene) > 4 & log10(nUMIsPerGene) < 4.5)[1]] 
+myGene = "VIM"
+
+ggplot(cf) + geom_point(aes(x=radialPosition, y=!!sym(myGene)))
+
+D = cf %>% select(radialPosition, all_of(myGene), nUMIsPerCell)
+colnames(D) = c("r", "ngc", "Nc")
+
+fMin = 1/sum(nUMIsPerCell)
+
+#theta = c(a=1/mean(nUMIsPerCell), b=0, c=0)
+theta = c(a=log10(1/mean(nUMIsPerCell)), b=0, c=0)
+fg = function(r, theta) {
+  if ( is.na(theta["c"]) ) {theta["c"]=0}
+  #exp(theta["a"]) + theta["b"]*r
+  #fgs = as.list(theta) %>% with( 10^a + b * r )
+  fgs = as.list(theta) %>% with( 10^a + b * r + c * r^2)
+  fgs[fgs>1] = 1
+  fgs[fgs<fMin] = fMin
+  return(fgs)
+}
+
+L = function(theta, D) {
+#  browser()
+  fgs = fg(D %>% pull(r), theta)
+  # if ( sum(fgs < 0 | fgs > 1) > 0 ) { return(-Inf) }
+  lambda = fgs * ( D %>% pull(Nc) )
+  sum(dpois(D %>% pull(ngc), lambda, log = T))
+}
+L(theta, D)
+
+
+optRes = optim(theta, L, D=D, control=list(fnscale=-1))
+optRes$par
+
+Lnv = function(a, b, c, D) {
+  L(c(a=a, b=b, c=c), D)
+}
+dLsq = hessian(Lnv, var=optRes$par, params=list(D=D))
+covTheta = solve(-dLsq) 
+sigmas = covTheta %>% diag %>% .^(1/2)
+#sigmas = -dLsq %>% diag %>% .^(-1/2)
+
+names(sigmas) = names(theta)
+
+#sprintf("b = %.3e, sigma = %.3e", optRes$par["b"], sigmas["b"])
+sprintf("%s = %.3e, sigma = %.3e", names(optRes$par), optRes$par, sigmas)
+
+p = (1 - pnorm(abs(optRes$par / sigmas))) * 2
+p["b"]
+
+```
+
+
+sim data f(r) -> poi: show counts vs position: does model fit the data?
+```{r}
+sim = D %>% pmap(function(r, ngc, Nc) {
+  # rpois(1, fg(D %>% pull(r), optRes$par) * (D %>% pull(Nc)))  
+  rpois(1, fg(r, optRes$par) * Nc)
+}) %>% unlist
+
+ggplot(D) + geom_point(aes(x=r, y=ngc))
+simT = tibble(r=D %>% pull(r), ngc=sim)
+ggplot(simT) + geom_point(aes(x=r, y=ngc)) #+ ylim(0,1200)
+```
+Conclusion: the gene expression data is overdispersed: cells are probably in different transcriptional states
+
+We can fix this by using a negative binomial in the likelihood function, thus fitting an overdispersion parameter. 
+
+
+# Streamline intcpt, slope inference
+```{r}
+# cf %>% select(myGene)
+# cf %>% select(radialPosition)
+# ggplot(cf) + geom_point(aes(x=radialPosition, y=!!sym(myGene)))
+rm(myGene, fitSize, scndOrder)
+estIntcptSlope = function(myGene, cf, fitSize=T, scndOrder=T) {
+  #browser()
+  D = cf %>% select(radialPosition, all_of(myGene), nUMIsPerCell)
+  colnames(D) = c("r", "ngc", "Nc")
+  
+  expA = log10((D %>% pull(ngc) %>% sum) / (D %>% pull(Nc) %>% sum))
+
+  #estimate over-dispersion
+  estOD =
+    D %>% mutate(sUMIs=median(Nc)*ngc/Nc) %>% select(sUMIs) %>% #standardized UMIs
+    summarize(mu=mean(sUMIs), tVar=var(sUMIs)) %>% 
+    mutate(vByM=tVar/mu) %>% 
+    mutate(size=mu*(vByM-1)^(-1))
+  estSize = log10(estOD %>% pull(size))
+
+  #theta = c(a=1/mean(nUMIsPerCell), b=0, c=0)
+  theta = c(a=expA, b=0)
+  if ( scndOrder ) { 
+    theta = c(theta, c=0)
+  } 
+  if ( fitSize ) {
+    theta = c(theta, size=estSize)
+  }
+
+  L = function(theta, D, estSize) {
+    if ( is.na(theta["c"]) ) { theta["c"]=0 }
+    fgs = fg(D %>% pull(r), theta)
+    # if ( sum(fgs < 0 | fgs > 1) > 0 ) { return(-Inf) }
+    # if ( theta["size"] < 0 ) { return(-Inf) }
+    lambda = fgs * ( D %>% pull(Nc) )
+    L = sum(dnbinom(D %>% pull(ngc), 
+                    size=ifelse(is.na(theta["size"]), 10^estSize, 10^theta["size"]), 
+                    mu=lambda, log = T))
+    ##for TNC, fitting makes 'a' super small so that the gradient vanishes and we can't estimate sigmas.
+    ##Fix it by adding a soft lower bound on a around 1/nReads in the total experiment
+    #L = L - 1 / (10^theta["a"] * sum(nUMIsPerCell))
+    L = L - 1 / (10^theta["a"] * 10 * median(nUMIsPerCell))
+    #we also add a gaussian prior on b and c- could help making likelihood less flat
+    L = L + 
+      dnorm(theta["b"], mean=0, sd=1e-3, log=T) +
+      dnorm(theta["c"], mean=0, sd=1e-3, log=T)
+    return(L)
+  }
+  
+  #L(theta, D, )
+  #Do first quick parameter sweep, 1st order without size estimation
+  optResInit = optim(theta[c("a", "b")], L, D=D, estSize=estSize, control=list(fnscale=-1))
+
+  ## Try random parameters --- NO NEED: Nedler-Mead finds the optimum  
+  # LmatIn = 
+  #   tibble(a=runif(1e3, min=log10(fMin), max=log10(3e-3)),
+  #          b=runif(1e3, min=-3e-3, max=3e-3))
+  # LLs = LmatIn %>% pmap(function(a,b) {
+  #   #theta1 = c(a=a, b=b)
+  #   #optRes = optim(theta1, L, D=D, estSize=estSize, method="CG", control=list(fnscale=-1))
+  #   L(c(a=a, b=b), D, estSize=estSize)
+  # }) %>% unlist
+  # maxIdx = LLs %>% which.max
+  # bestTheta1 = LmatIn[maxIdx,] %>% select("a","b") %>% as.numeric()
+  # names(bestTheta1) = c("a", "b")
+  
+  ## Visualizes likelihood as fn of a, b
+  # LmatIn =
+  #   tibble(a=seq(log10(fMin),log10(3e-4), len=30),
+  #          b=seq(-1e-4, 5e-5, len=30)) %>%
+  #   expand(a, b)
+  # Lmat =
+  #   bind_cols(LmatIn,
+  #             tibble(tL=
+  #                      LmatIn %>% pmap(function(a,b) {
+  #                        L(c(a=a, b=b), D, estSize=estSize)
+  #                      }) %>% unlist
+  #             ))
+  # Lmat[Lmat[,"tL"]<max(Lmat[,"tL"]-100),"tL"] = max(Lmat[,"tL"]-100)
+  # ggplot(Lmat, aes(x=a, y=b)) +
+  #   geom_tile(aes(fill=tL)) +
+  #   geom_point(data=tibble(a=optResInit$par["a"], b=optResInit$par["b"]), col="white") +
+  #   #geom_point(data=tibble(a=bestTheta1["a"], b=bestTheta1["b"]), col="black") +
+  #   geom_contour(aes(z=tL))
+  # calculus::hessian(f=function(a,b) {L(c(a=a, b=b), D=D, estSize=estSize)}, var=optResInit$par)
+  
+  #Then fit full model
+  #if (scndOrder) {
+  theta[names(optResInit$par)] = optResInit$par
+  optRes = optim(theta, L, D=D, estSize=estSize, control=list(fnscale=-1))
+  #}
+  
+  # optRes = optim(theta, L, D=D, noScndOrd=F, method="BFGS", control=list(fnscale=-1))
+  # optRes = optim(theta, L, D=D, noScndOrd=F, method="CG", control=list(fnscale=-1))
+  # optRes = optim(theta, L, D=D, noScndOrd=F, control=list(fnscale=-1))
+
+  log2fc = log2(range(fg(D %>% pull(r), optRes$par))) %>% diff
+  #log2fc = with(optRes$par %>% as.list, log2( (10^a+b)/10^a ) )
+  
+  #sigmas = numeric()
+  #dLsq = hessian(L, optRes$par, D=D, estSize=estSize)
+  dLsq = calculus::hessian(f=function(...) {L(c(...), D=D, estSize=estSize)}, var=optRes$par)
+  #eigen(-dLsq)
+  tryCatch({
+    #varTheta = solve(-dLsq) %>% diag
+    varTheta = -1/diag(dLsq) ### was using this initially
+    names(varTheta) = names(optRes$par)
+    #if varTheta is vanishly small (<tol), set it to tol
+    tol = 1/(median(nUMIsPerCell)^2)
+    varTheta[abs(varTheta)<tol] = tol
+    # if ( sum(varTheta<0) > 0 & scndOrder == T ) {
+    #   theta[names(optResInit$par)] = optResInit$par
+    #   theta = theta[names(theta) != "c"]
+    #   optRes = optim(theta, L, D=D, estSize=estSize, control=list(fnscale=-1))
+    # 
+    #   log2fc = log2(range(fg(D %>% pull(r), optRes$par))) %>% diff
+    #   
+    #   dLsq = calculus::hessian(f=function(...) {L(c(...), D=D, estSize=estSize)}, var=optRes$par)
+    #   varTheta = solve(-dLsq) %>% diag
+    #   names(varTheta) = names(optRes$par)
+    #   #if varTheta is vanishly small (<tol), set it to tol
+    #   tol = 1/(median(nUMIsPerCell)^2)
+    #   varTheta[abs(varTheta)<tol] = tol
+    # }
+    
+    # if ( varTheta["b"] > 0 ) {
+    #   sigmas["b"] = sqrt(varTheta["b"])
+    # } else {
+    #   stop("fitting issue")
+    # }
+    # if ( scndOrder && varTheta["c"] > 0 ) {
+    #   sigmas["c"] = sqrt(varTheta["c"])
+    # } else {
+    #   stop("fitting issue")
+    # }
+    sigmas = sqrt(varTheta)
+
+    p = (1 - pnorm(abs(optRes$par[names(sigmas)] / sigmas))) * 2 #x 2 for bilateral
+  }, error=function(conf) {
+    sigmas = rep(NaN, length(optRes$par))
+    names(sigmas) = names(optRes$par)
+    p = runif(length(optRes$par))
+    names(p) = names(optRes$par)
+  })
+  # if ( is.nan(sigmas["b"]) ) {
+  #   p["b"] = runif(1)
+  # }
+  # if ( scndOrder && is.nan(sigmas["c"]) ) {
+  #   p["c"] = runif(1)
+  # }
+
+  #aggrP = ifelse(scndOrder, min(p[c("b", "c")]), p["b"])
+  aggrP = ifelse(scndOrder, prod(p[c("b", "c")]), p["b"])
+  # sprintf("%s = %.3e, sigma = %.3e", names(optRes$par), optRes$par, sigmas)
+  
+  return(tibble(gene=myGene, 
+                a=optRes$par["a"], b=optRes$par["b"], c=ifelse(!is.na(optRes$par["c"]), optRes$par["c"], 0),
+                size=ifelse(fitSize, optRes$par["size"], estSize), 
+                sigmaB=sigmas["b"], sigmaC=sigmas["c"], 
+                pB=p["b"], pC=p["c"],
+                p=aggrP, log2fc=log2fc, L=optRes$value))
+}
+
+estIntcptSlope("VIM", cf, fitSize=T, scndOrder=F)
+estIntcptSlope("VIM", cf, fitSize=T, scndOrder=T)
+
+estIntcptSlope("TNC", cf, fitSize=T, scndOrder=F)
+estIntcptSlope("TNC", cf, fitSize=T, scndOrder=T)
+
+myGenes = c(geneNames[nUMIsPerGene>nCells][1:8], "VIM", "TNC")
+
+estIntcptSlope("TSPAN6", cf, fitSize=T, scndOrder=T)
+
+estIntcptSlope("FOS", cf, fitSize=T, scndOrder=T)
+#estIntcptSlope(myGenes[348], cf, fitSize=T)
+#estIntcptSlope(myGenes[2696], cf, fitSize=T, scndOrder = F)
+
+# allIntcptSlopes = map(myGenes,
+#                       function(myGene) {
+#                         estIntcptSlope(myGene, cf=cf, fitSize=T, scndOrder = F)
+#                       }, .progress=T) %>%
+#   bind_rows()
+# allIntcptSlopes %>% arrange(desc(log2fc)) %>% filter(p<.01)
+# 
+# allIntcptSlopes = map(myGenes,
+#                       function(myGene) {
+#                         estIntcptSlope(myGene, cf=cf, fitSize=T, scndOrder = T)
+#                       }, .progress=T) %>%
+#   bind_rows()
+# allIntcptSlopes %>% arrange(desc(log2fc)) %>% filter(p<.01)
+```
+
+# Do first order fits of all genes
+
+```{r}
+# myGenes = geneNames[nUMIsPerGene/nCells>1]
+# plan(multisession, workers = 10)
+# allIntcptSlopes = future_map(myGenes,
+#                              function(myGene) {
+#                                estIntcptSlope(myGene, cf=cf, fitSize=T, scndOrder=F)
+#                              }, .options=furrr_options(seed=T), .progress=T) %>%
+#   bind_rows()
+# 
+# if (nrow(allIntcptSlopes)>100) {
+#   allIntcptSlopes =
+#     allIntcptSlopes %>%
+#     mutate(q=allIntcptSlopes %>% pull(p) %>% fdrtool(statistic="pvalue") %>% .["qval"] %>% unlist)
+# }
+# write_rds(allIntcptSlopes, file="allIntcptSlopes_1stOrder.rds")
+# 
+# allIntcptSlopes %>% arrange(desc(log2fc)) %>% filter(q<.05) %>% nrow
+# allIntcptSlopes %>% filter(q<.05) %>% filter(b>0) %>% arrange(desc(log2fc)) %>% write_csv("topSpatialGenes_outside.csv")
+# allIntcptSlopes %>% filter(q<.05) %>% filter(b<0) %>% arrange(desc(log2fc)) %>% write_csv("topSpatialGenes_inside.csv")
+
+
+
+
+#write_rds(allIntcptSlopes, file="allIntcptSlopes.rds")
+#allIntcptSlopes %>% filter(p<.01) %>% filter(abs(log2fc)>1) %>% arrange(log2fc) %>% write_csv("topSpatialGenes.csv")
+
+```
+# Do second order fit
+```{r}
+myGenes = geneNames[nUMIsPerGene/nCells>1]
+# allIntcptSlopes = future_map(myGenes,
+#                              function(myGene) {
+#                                estIntcptSlope(myGene, cf=cf, fitSize=T, scndOrder=T)
+#                              }, .options=furrr_options(seed=T), .progress=T) %>%
+#   bind_rows()
+
+# write_rds(allIntcptSlopes, file="allIntcptSlopes_2ndOrder_raw_calcein.rds")
+# write_rds(allIntcptSlopes, file="allIntcptSlopes_2ndOrder_raw.rds")
+
+allIntcptSlopes = read_rds("allIntcptSlopes_2ndOrder_raw_calcein.rds")
+
+allIntcptSlopes %>% ggplot(aes(x=L)) + geom_histogram()
+ggsave("histLikelihood.pdf", height=3, width=4)
+```
+
+## ---init ends here---
+
+## Visualize genes with different goodness of fit
+```{r}
+allLs = allIntcptSlopes %>% pull(L)
+
+seq(min(allLs), max(allLs), len=8) %>% 
+  map(function(targetL) {
+    allIntcptSlopes %>% mutate(Ldiff = abs(L - targetL)) %>% arrange(Ldiff) %>% head(1)
+  }) %>% bind_rows %>% pull(gene) %>% 
+  map(function(myGene) {
+    D = cf %>% select(radialPosition, myGene, nUMIsPerCell)
+    colnames(D) = c("r", "ngc", "Nc")
+    
+    # raw data
+    ggplot(D) + geom_point(aes(x=r, y=ngc)) + 
+      ggtitle(sprintf("%s, L=%.1f", myGene, 
+                      allIntcptSlopes %>% filter(gene==myGene) %>% pull(L)
+      ))
+    ggsave(sprintf("%s_rVsUMIs.pdf", myGene), height=3, width=4)
+    
+    myTheta = 
+      allIntcptSlopes %>% filter(gene==myGene) %>% select(a,b,c,size) %>% unlist()
+    names(myTheta) = names(myTheta) %>% str_replace("\\..*$", "")
+    
+    sim = D %>% pmap(function(r, ngc, Nc) {
+      rnbinom(1, size=10^myTheta["size"], mu=fg(r, myTheta) * Nc)  
+    }) %>% unlist
+    simT = tibble(r=D %>% pull(r), ngc=sim)
+
+    # sim-fitted data
+    ggplot(simT) + geom_point(aes(x=r, y=ngc)) + ylim(range(D %>% pull(ngc))) +
+      ggtitle(sprintf("%s (simulation), L=%.1f", myGene, 
+                      allIntcptSlopes %>% filter(gene==myGene) %>% pull(L)
+      ))
+    ggsave(sprintf("%s_rVsSimUMIs.pdf", myGene), height=3, width=4)
+  })
+#-7000 ok
+#-7500 / -8000 a little off
+#-9000 not strinkingly off
+#-10'000 bad fit
+```
+
+## Process p-values into q-values
+```{r}
+
+minL = -7500
+addQvalues = function(allIntcptSlopes, qCutOff=.1, log2fcCutOff=log2(1.3)) {
+  allIntcptSlopes = allIntcptSlopes %>% 
+    mutate(pRnd=runif(nrow(allIntcptSlopes), min=qCutOff, max=1))
+  allIntcptSlopes =
+    allIntcptSlopes %>%
+    mutate(p=ifelse(L>minL, p, pRnd)) %>% #don't trust fits with L<minL
+    mutate(p=replace_na(p, runif(1, qCutOff, 1)))
+  
+  # allIntcptSlopes %>% 
+  #   mutate(q=p.adjust(p, method="BH")) %>%
+  #   mutate(qB=p.adjust(pB, method="BH")) %>%
+  #   mutate(qC=p.adjust(pC, method="BH")) %>% 
+  #   mutate(toReport=((qB<qCutOff|qC<qCutOff) & log2fc>log2fcCutOff))
+    #mutate(toReport=(q<qCutOff & log2fc>log2fcCutOff))
+  
+  allQs = p.adjust(c(allIntcptSlopes %>% pull(pB), 
+                     allIntcptSlopes %>% pull(pC)), method="BH")
+  allIntcptSlopes %>% 
+    # mutate(q=p.adjust(p, method="BH")) %>%
+    mutate(qB=allQs[1:nrow(allIntcptSlopes)]) %>%
+    mutate(qC=allQs[nrow(allIntcptSlopes)+(1:nrow(allIntcptSlopes))]) %>% 
+    mutate(toReport=((qB<qCutOff|qC<qCutOff) & log2fc>log2fcCutOff))
+  
+  # allIntcptSlopes %>% 
+  #   mutate(q=allIntcptSlopes %>% pull(p) %>% 
+  #            fdrtool(statistic="pvalue") %>% 
+  #            .["qval"] %>% unlist) %>% 
+  #   mutate(toReport=(q<qCutOff & log2fc>log2fcCutOff))
+}
+
+allIntcptSlopes = addQvalues(allIntcptSlopes)
+# non-fittable genes
+nNonFit = allIntcptSlopes %>% filter(L<(minL)) %>% nrow()
+# fittable genes
+( allIntcptSlopes %>% nrow() ) - nNonFit
+
+#
+#allIntcptSlopes %>% filter(q<.1) %>% nrow #number
+allIntcptSlopes %>% filter(qB<.1 | qC<.1) %>% nrow #number
+
+allIntcptSlopes[allIntcptSlopes %>% pull(toReport) %>% is.na,] #problematic genes
+
+# spatial genes
+allIntcptSlopes %>% pull(toReport) %>% sum #number
+allIntcptSlopes %>% pull(toReport) %>% mean #fraction
+
+# ggplot(allIntcptSlopes) +
+#   geom_point(aes(x=log2fc, y=q)) +
+#   scale_y_log10()
+```
+
+## Downsampling study
+```{r}
+downSample = function(cf, pD=.1) {
+  justCounts = cf[,6:ncol(cf)]
+  justCountsDS =
+    future_map(1:nrow(justCounts), function(rowId) { #
+      map(justCounts[rowId,] %>% as.numeric,
+                 function(nReads) {
+                   rbinom(n=1, size=nReads, prob=pD)
+                 }) %>%
+        unlist %>% matrix(nrow=1) %>% as.data.frame
+    }, .options=furrr_options(seed=T), .progress=T) %>% bind_rows()
+  cf[,6:ncol(cf)] = justCountsDS
+  return(cf)
+}
+
+# nGenesDownSamplingT =
+#   map(c(.01/3, .01, .01*3, .1, .3), function(dsr) {
+#     cat(sprintf("sampling rate = %.3f\n", dsr))
+#     map(1:5, function(repId) {
+#       cat(sprintf("rep %d\n", repId))
+#       cfDS = downSample(cf, dsr)
+#       nUMIsPerGene = apply(cfDS %>% .[,6:ncol(cfDS)] %>% select(-nUMIsPerCell), 2, sum)
+#       myGenes = geneNames[nUMIsPerGene/nCells>1]
+#       allIntcptSlopes = future_map(myGenes,
+#                                    function(myGene) {
+#                                      estIntcptSlope(myGene, cf=cf, fitSize=T, scndOrder=T)
+#                                    }, .options=furrr_options(seed=T), .progress=T) %>%
+#         bind_rows()
+#       allIntcptSlopes = addQvalues(allIntcptSlopes)
+#       tibble(dsr=dsr, repId=repId, nGenes=allIntcptSlopes %>% filter(toReport) %>% nrow())
+#     }) %>% bind_rows()
+#   }) %>% bind_rows()
+# write_rds(nGenesDownSamplingT, file="nGenesDownSamplingT.rds")
+nGenesDownSamplingT = read_rds("nGenesDownSamplingT.rds")
+
+nGenesDownSamplingT %>% 
+  mutate(nUMIsPerCell = dsr * (cf %>% pull(nUMIsPerCell) %>% mean)) %>% 
+  bind_rows(tibble(dsr=1, repId=1, 
+                   nGenes=allIntcptSlopes %>% filter(toReport) %>% nrow(), 
+                   nUMIsPerCell=median(nUMIsPerCell))) %>% 
+  ggplot(aes(x=nUMIsPerCell, y=nGenes)) +
+  geom_point() + geom_line() +
+  scale_x_log10() +
+  labs(x="# of UMIs per cell", y="# of significant spatial genes")
+ggsave("nSpatialGenesVsUMIs.pdf", height=3, width=4)
+
+# sum(cf[,6:ncol(cf)])/1e3 #UMIs per cell
+# sum(cfDS[,6:ncol(cfDS)])/1e3 #UMIs per cell
+```
+
+## Label spatial expression pattern
+```{r}
+# classLocation = function(b, c, pC) {
+classLocation = function(b, c) {
+  loc = rep("other", length(b))
+  # extrema = 
+  #   (-b/(2*c) > 1/4 &
+  #      -b/(2*c) < 1/2 &
+  #      c > 0 & pC<.01 )
+  # intermediate =
+  #       (-b/(2*c) > 1/4 &
+  #      -b/(2*c) < 1/2 &
+  #      c < 0 & pC<.01 )
+  # periph =
+  #   (b + c * maxRthresh > 0)
+  # core =
+  #   (b + c * maxRthresh < 0)
+  rs = -b/(2*c)
+  extrema = c>0 & 1/3 < rs & rs < 2/3 
+  intermediate = c<0 & 1/3 < rs & rs < 2/3
+  periph = b>0 & (b+2*c) > 0
+  core = b<0 & (b+2*c) < 0
+  loc[periph] = "periphery"
+  loc[core] = "core"
+  loc[extrema] = "extrema"
+  loc[intermediate] = "intermediate"
+  return(loc)
+}
+
+allIntcptSlopes =
+  allIntcptSlopes %>% 
+  mutate(location=classLocation(b,c)) %>% 
+  mutate(rs=-b/(2*c))
+
+#library(gprofiler2)
+
+# order genes by spatial gene expr pattern
+genesBySGEP = 
+  allIntcptSlopes %>% 
+  filter(L>minL) %>% 
+  filter(log2fc>log2(1.3)) %>% 
+  filter(location != "other")
+
+locationStats = genesBySGEP %>% 
+  filter(toReport) %>% 
+  group_by(location) %>% 
+  summarize(location=unique(location), n=n()) %>% 
+  mutate(location=fct_reorder(location, -n))
+locationStats %>% 
+  ggplot(aes(x=location, y=n, fill=location)) + geom_col() +
+  ylab("number of genes")
+ggsave("nGenesByLocation.pdf", height=2, width=5)
+
+nTop = 3
+genesToShowT = 
+  bind_rows(genesBySGEP %>% filter(location == "extrema") %>% arrange(b) %>% head(nTop),
+            genesBySGEP %>% filter(location == "intermediate") %>% arrange(desc(b)) %>% head(nTop),
+            genesBySGEP %>% filter(location == "core") %>% arrange(b) %>% head(nTop),
+            genesBySGEP %>% filter(location == "periphery") %>% arrange(desc(b)) %>% head(nTop))
+
+allIntcptSlopes %>% 
+  filter(L>minL) %>% 
+  filter(log2fc>log2(1.3)) %>% 
+  filter(location != "other") %>% 
+  mutate(location=fct_inorder(location)) %>% 
+  ggplot() +
+  geom_point(aes(x=b, y=c, color=location)) +
+  geom_label_repel(aes(x=b, y=c, label=gene, color=location), data=genesToShowT) +
+  labs(x="linear trend (b)", y="quadratic trend (c)")
+ggsave("linQuadrTrendsScatter.pdf", height=3, width=5)
+
+allLocs = allIntcptSlopes %>% pull(location) %>% unique
+```
+
+## Functional enrichment in four spatial patterns
+```{r}
+
+# tAllLocs = allIntcptSlopes %>% filter(toReport) %>% pull(location) %>% unique()
+# myLoc = tAllLocs[1]
+# fnByLocL = map(allLocs, function(myLoc) {
+#   tLocTab = allIntcptSlopes %>% filter(location == myLoc, toReport)
+#   cat(sprintf("Now processing %d %s genes\n", nrow(tLocTab), myLoc))
+#   tLocTab %>%
+#     arrange(desc(log2fc)) %>%
+#     write_csv(sprintf("topGenes_2ndOrder_%s.csv", myLoc))
+# 
+#   gostRes =
+#     gost(query=tLocTab %>% arrange(desc(log2fc)) %>% pull(gene),
+#          ordered_query = TRUE, organism = "hsapiens",
+#          significant = T, custom_bg = geneNames,
+#          domain_scope = "custom")
+#   gostplot(gostRes, capped = TRUE, interactive = TRUE)
+#   return(gostRes$result)
+# })
+
+allLocs = genesBySGEP %>% pull(location) %>% unique()
+myLoc = allLocs[1]
+fnByLocL = future_map(allLocs, function(myLoc) {
+  tLocTab = genesBySGEP %>% filter(location == myLoc) %>% filter(toReport)
+  cat(sprintf("Now processing %d %s genes\n", nrow(tLocTab), myLoc))
+  tLocTab %>% 
+    arrange(desc(log2fc)) %>%
+    write_csv(sprintf("topGenes_2ndOrder_%s.csv", myLoc))
+
+  gostRes =
+    gost(query=tLocTab %>% arrange(desc(log2fc)) %>% pull(gene),
+         ordered_query = T, organism = "hsapiens",
+         significant = F, 
+         custom_bg = geneNames,
+         # custom_bg = allIntcptSlopes %>% pull(gene),
+         # custom_bg = genesBySGEP %>% pull(gene),
+         domain_scope = "custom")
+  # gostplot(gostRes, capped = TRUE, interactive = TRUE)
+  return(gostRes$result)
+})
+names(fnByLocL) = allLocs
+write_rds(fnByLocL, "fnByLocL.rds")
+fnByLocL = read_rds("fnByLocL.rds")
+
+map(allLocs, function(myLoc) {
+  fnByLocL[[myLoc]] %>% select(term_name, p_value, term_id, source) %>% unique() %>%
+    filter(source %in% c("CORUM", "REAC", "KEGG")) %>% arrange(p_value) %>% 
+    mutate(q=p.adjust(p_value, method="BH")) %>% 
+    filter(q<.1) %>%
+    relocate(term_name, q) %>% 
+    write_csv(sprintf("fnByLoc_%s.csv", myLoc))
+})
+#   #filter(! source %in% c("HPA", "TF", "MIRNA", "GO:CC", "GO:MF")) %>% arrange(p_value)
+# fnByLocL[["core"]] %>% select(source, term_name, p_value) %>% unique() %>%
+#   filter(source %in% c("CORUM", "REAC", "KEGG")) %>% arrange(p_value)
+# fnByLocL[["intermediate"]] %>% select(source, term_name, p_value) %>% unique() %>%
+#   filter(source %in% c("CORUM", "REAC", "KEGG")) %>% arrange(p_value)
+# fnByLocL[["extrema"]] %>% select(source, term_name, p_value) %>% unique() %>%
+#   filter(source %in% c("CORUM", "REAC", "KEGG")) %>% arrange(p_value)
+# fnByLocL[["other"]] %>% select(source, term_name, p_value) %>% unique() %>%
+#   filter(source %in% c("CORUM", "REAC", "KEGG")) %>% arrange(p_value)
+
+# allIntcptSlopes %>% 
+#   filter(q<.05) %>% 
+#   arrange(location, desc(log2fc)) %>% 
+#   write_csv("topGenes_2ndOrder_byLocation.csv")
+
+# write_rds(allIntcptSlopes, file="allIntcptSlopes_2ndOrder.rds")
+
+```
+## Survival analysis by gene location
+```{r}
+library(survival)
+library(survminer)
+library(RTCGA)
+library(RTCGA.clinical)
+library(RTCGA.mRNA)
+
+dim(BRCA.clinical)
+# names(BRCA.clinical)
+
+clin <- survivalTCGA(BRCA.clinical, #OV.clinical, GBM.clinical, 
+                     extract.cols="admin.disease_code")
+head(clin)
+# table(clin$admin.disease_code)
+# xtabs(~admin.disease_code+patient.vital_status, data=clin) %>% addmargins()
+#coxph(Surv(times, patient.vital_status)~admin.disease_code, data=clin)
+
+dim(BRCA.mRNA)
+BRCA.mRNA[1:5, 1:5]
+
+tAllLocs = genesBySGEP %>% pull(location) %>% unique()
+myLoc = tAllLocs[2]
+fnByLocL = map(tAllLocs, function(myLoc) {
+  tLocTab = genesBySGEP %>% filter(location == myLoc)
+  cat(sprintf("Now processing %d %s genes\n", nrow(tLocTab), myLoc))
+
+  myGeneSig = tLocTab %>% pull(gene) %>% intersect(colnames(BRCA.mRNA))
+  cat(sprintf("%d genes left afer joining with TCGA\n", length(myGeneSig)))
+  sigAvg = BRCA.mRNA[,myGeneSig] %>% apply(1, mean)
+  survData = 
+    tibble(patient=BRCA.mRNA[,1], sigAvg=sigAvg) %>% 
+    drop_na() %>% 
+    mutate(bcr_patient_barcode=str_sub(patient, 0, 12)) %>% 
+    inner_join(clin)
+  survData = survData %>% 
+    mutate(sigHigh=sigAvg>median(sigAvg)) %>% 
+    #mutate(sigBin=cut(sigAvg, breaks=quantile(sigAvg, c(0, 1/4, 1/2, 3/4, 1)))) %>% 
+    mutate(sigBin=cut(sigAvg, breaks=3))
+  #browser()
+  survData %>% pull(sigBin) %>% table
+  coxph(Surv(times, patient.vital_status)~sigAvg, data=survData)
+  coxph(Surv(times, patient.vital_status)~sigHigh, data=survData)
+  coxph(Surv(times, patient.vital_status)~sigBin, data=survData)
+  sfit <- survfit(Surv(times, patient.vital_status)~sigBin, data=survData)
+  ggsurvplot(sfit, conf.int=TRUE, pval=TRUE, data=survData, title=myLoc) %>% print
+  ggsave(sprintf("survival_%s.pdf", myLoc), height=5, width=7)
+  return(sfit)
+})
+
+
+```
+Conclusion: high expression of the peripheral signature correlates with longer survival 
+
+# Visualize a set of genes
+```{r}
+# myGenes = c("LBP", "CDH11",  #core
+#             "MMP1", "EGR1",  #extrema
+#             "TMEM268", "TSPYL5", #intermediate
+#             "IL13RA2", "TNC") #peri
+
+# antibody-tested genes
+myGenes = c("VIM", "MKI67", "FOS", #aka AP-1
+            "JUN", "EGR1", "DDIT4", #aka HIF1 responsive
+            "VMP1", 
+            # "SIRT1", "TP53",
+            "ATP5PB", "G3BP1", "SET", #intermediate
+            "ATF4", "EIF4A2", "SLC3A2"
+            ) #, "CYSLT1R")
+
+# Add top 10 intermediate and extrema genes
+myGenes = c(myGenes,
+            # allIntcptSlopes %>% filter(location=="extrema") %>% 
+            #   filter(L>minL) %>% arrange(desc(log2fc)) %>% pull(gene) %>% .[1:10],
+            # allIntcptSlopes %>% filter(location=="intermediate") %>% 
+            #   filter(L>minL) %>% arrange(desc(log2fc)) %>% pull(gene) %>% .[1:10],
+            genesToShowT %>% pull(gene))
+
+# show fitted spatial regulation for sets of genes
+myLoc = "intermediate"
+map(genesToShowT %>% pull(location) %>% unique, function(myLoc) {
+  myGene = "SET"
+  plotT = genesToShowT %>% 
+    filter(location == myLoc) %>% 
+    pull(gene) %>% 
+    map(function(myGene) {
+      myTheta = 
+        allIntcptSlopes %>% filter(gene==myGene) %>% select(a,b,c,size) %>% unlist()
+      names(myTheta) = names(myTheta) %>% str_replace("\\..*$", "")
+      
+      tibble(r=seq(0,maxRthresh,len=100)) %>% 
+        mutate(f=fg(r, myTheta)) %>% 
+        mutate(gene=myGene)
+    }) %>% bind_rows() 
+  plotT %>% 
+    ggplot(aes(x=r, y=f, color=gene, group=gene)) + 
+    geom_line() + 
+    scale_y_log10() +
+    labs(x="radial position", y="fractional abundance")
+  ggsave(sprintf("viewGenes_%s.pdf", myLoc), height=2, width=4)
+  
+  genesToShowT %>% 
+    filter(location == myLoc) %>% 
+    pull(gene) %>% 
+    map(function(myGene) {
+      myTheta = 
+        allIntcptSlopes %>% filter(gene==myGene) %>% select(a,b,c,size) %>% unlist()
+      names(myTheta) = names(myTheta) %>% str_replace("\\..*$", "")
+      
+      tibble(r=seq(0,maxRthresh,len=100)) %>% 
+        mutate(f=fg(r, myTheta)) %>% 
+        mutate(rBin=cut(r, 2, labels=F) %>% as.factor() %>% 
+                 fct_recode(core="1", periphery="2")) %>% 
+        group_by(rBin) %>% summarize(f=median(f)) %>% 
+        mutate(gene=myGene)
+    }) %>% bind_rows() %>% 
+    ggplot(aes(x=rBin, y=f, color=gene, group=gene)) + 
+    geom_line() + 
+    scale_y_log10() +
+    labs(x="radial position", y="fractional abundance") +
+    lims(y=plotT %>% pull(f) %>% range)
+  ggsave(sprintf("viewGenes_%s_binned.pdf", myLoc), height=2, width=4)
+})
+
+
+# Show fractional abundance for chosen genes  
+map(myGenes, function(myGene) {
+  D = cf %>% select(radialPosition, myGene, nUMIsPerCell)
+  colnames(D) = c("r", "ngc", "Nc")
+  D = D %>% mutate(fEst=ngc/Nc)
+  
+  myTheta = 
+    allIntcptSlopes %>% filter(gene==myGene) %>% select(a,b,c,size) %>% unlist()
+  names(myTheta) = names(myTheta) %>% str_replace("\\..*$", "")  
+  fittedT = tibble(r=seq(0.1,maxRthresh,len=100)) %>% 
+    mutate(f=fg(r, myTheta))
+  
+  yMax = D %>% pull(fEst) %>% quantile(.99)
+  ggplot(D) + 
+    geom_point(aes(x=r, y=fEst), alpha=.1) + #geom_smooth(aes(x=r, y=fEst), color="#444444") +
+    geom_line(aes(x=r, y=f), color="#FF5555", data=fittedT) + 
+    labs(x="radial position", y="fractional abundance") +
+    ylim(0, yMax) +
+    #scale_y_log10() +
+    ggtitle(myGene)
+  ggsave(sprintf("viewGene_%s.pdf", myGene), height=2, width=2.5)
+})
+```
+
+
+# Visualize a fit
+```{r}
+myGene = "JUN"
+
+myGene = "TNC"
+myGene = "CFH"
+myGene = "FUCA2"
+myGene = "TSPAN6"
+myGene = "DPM1"
+myGene = "STPG1"
+myGene = "DDIT4"
+#myGene = "CDKN3"
+
+myGene = "VMP1" #core
+myGene = "VIM" #periphery
+#myGene = "FOS" #Hessian issue!
+
+myTheta = 
+  allIntcptSlopes %>% filter(gene==myGene) %>% select(a,b,c,size) %>% unlist()
+names(myTheta) = names(myTheta) %>% str_replace("\\..*$", "")
+
+# fitted 2nd order polynom
+tibble(r=seq(0, maxRthresh, len=100)) %>% 
+  mutate(f=fg(r, myTheta)) %>% 
+  ggplot(aes(x=r, y=f)) + geom_line()
+
+D = cf %>% select(radialPosition, all_of(myGene), nUMIsPerCell)
+colnames(D) = c("r", "ngc", "Nc")
+
+# frac abundance + smoother
+#D %>% ggplot(aes(x=r, y=fEst)) + geom_point() + geom_smooth()
+
+sim = D %>% pmap(function(r, ngc, Nc) {
+  rnbinom(1, size=10^myTheta["size"], mu=fg(r, myTheta) * Nc)  
+}) %>% unlist
+
+# raw data
+ggplot(D, aes(x=r, y=ngc)) + 
+  geom_point(alpha=.1) +
+  geom_density_2d(alpha=.8, color="#FF5555", bins=8) +
+  labs(x="radial position", y="# UMIs per cell (data)")
+ggsave(sprintf("vizFit_%s_raw.pdf", myGene), height=2, width = 2.5)
+
+# 2nd order fit
+fittedT = tibble(r=seq(0.1,maxRthresh,len=100)) %>% 
+  mutate(f=fg(r, myTheta))
+  
+D = D %>% mutate(fEst=ngc/Nc)
+yMax = D %>% pull(fEst) %>% quantile(.99)
+ggplot(D) + 
+  geom_point(aes(x=r, y=fEst), alpha=.1) + #geom_smooth(aes(x=r, y=fEst), color="#444444") +
+  geom_line(aes(x=r, y=f), color="#FF5555", data=fittedT) + 
+  labs(x="radial position", y="fractional abundance") +
+  ylim(0, yMax) 
+  # scale_y_log10() +  ggtitle(myGene)
+ggsave(sprintf("vizFit_%s_fit.pdf", myGene), height=2, width=2.5)
+
+# sim-fitted data
+simT = tibble(r=D %>% pull(r), ngc=sim)
+ggplot(simT, aes(x=r, y=ngc)) + 
+  geom_point(alpha=.1) +
+  geom_density_2d(alpha=.8, color="#FF5555", bins=8) +
+  ylim(range(D %>% pull(ngc))) +
+  labs(x="radial position", y="# UMIs per cell (sim.)")
+ggsave(sprintf("vizFit_%s_sim.pdf", myGene), height=2, width = 2.5)
+```
+
+
+# Visualize top, mid, borderline significant spatial genes
+```{r}
+allIntcptSlopes =
+  allIntcptSlopes %>% 
+  mutate(q=pmap_dbl(list(qB, qC), function(qB, qC) min(qB, qC)))
+log10((allIntcptSlopes %>% pull(q) %>% sort) + 1e-6) %>% plot
+
+ggplot(allIntcptSlopes) + geom_point(aes(x=log10(q+1e-6), y=log2fc))
+myGene = "VIM"
+myGene = "LBP"
+
+bind_rows(
+  #lowest q, highest log2fc
+  allIntcptSlopes %>% filter(toReport) %>% arrange(q, desc(log2fc)) %>% head(10),
+  #closest to q=1e-4
+  allIntcptSlopes %>% filter(toReport) %>% mutate(qDiff = abs(q - 1e-4)) %>% arrange(qDiff) %>% head(2),
+  #highest q<.05
+  allIntcptSlopes %>% filter(toReport) %>% filter(q<.05) %>% arrange(desc(q)) %>% head(2)
+) %>% pull(gene) %>% 
+  map(function(myGene) {
+    cat(sprintf("Processing %s\n", myGene))
+    D = cf %>% select(radialPosition, myGene, nUMIsPerCell)
+    colnames(D) = c("r", "ngc", "Nc")
+    
+    ggplot(D) + geom_point(aes(x=r, y=ngc)) + ggtitle(myGene)
+    #ggsave(sprintf("%s_rVsUMIs.pdf", myGene), height=3, width=4)
+    
+    myTheta = 
+      allIntcptSlopes %>% filter(gene==myGene) %>% select(a,b,c,size) %>% unlist()
+    names(myTheta) = names(myTheta) %>% str_replace("\\..*$", "")
+    
+    fFit = tibble(r=seq(0,maxRthresh,len=100)) %>% 
+      mutate(f=fg(r, myTheta)) %>%  #%>% ggplot(aes(x=r, y=f)) + geom_line()
+      mutate(log10f = log10(f))
+    
+    D = D %>% 
+      mutate(fEst=ngc/Nc) %>% 
+      mutate(log10fEst=log10(ngc/Nc + 1/Nc))
+    try({
+      D %>% 
+        ggplot(aes(x=r, y=fEst)) + geom_point(alpha=.2) + 
+        #geom_smooth() + 
+        #geom_density_2d() +
+        geom_line(aes(y=f, color="red"), data=fFit) + #scale_y_log10() +
+        ggtitle(sprintf("%s, q = %.2e, L=%.1f", myGene, 
+                        allIntcptSlopes %>% filter(gene==myGene) %>% pull(q),
+                        allIntcptSlopes %>% filter(gene==myGene) %>% pull(L)))
+      ggsave(sprintf("%s_rVsF_fitted.pdf", myGene), height=3, width=4)
+    })
+    
+    D %>% 
+      ggplot(aes(x=r, y=log10fEst)) + geom_point(alpha=.2) + #geom_smooth() + 
+      #geom_density_2d() +
+      geom_line(aes(y=log10f, color="red"), data=fFit) + #scale_y_log10() +
+      ggtitle(sprintf("%s, q = %.2e, L=%.1f", myGene, 
+                      allIntcptSlopes %>% filter(gene==myGene) %>% pull(q),
+                      allIntcptSlopes %>% filter(gene==myGene) %>% pull(L)))
+    ggsave(sprintf("%s_rVsF_log10fitted.pdf", myGene), height=3, width=4)
+    
+    if ( myGene %in% c() ) {
+       D %>% 
+        ggplot(aes(x=r, y=fEst)) + geom_point() + #geom_smooth() + 
+        geom_line(aes(y=f, color="red"), data=fFit) + #scale_y_log10() +
+        ggtitle(sprintf("%s, q = %.2e, L=%.1f", myGene, 
+                        allIntcptSlopes %>% filter(gene==myGene) %>% pull(q),
+                        allIntcptSlopes %>% filter(gene==myGene) %>% pull(L)      
+        ))
+    }
+  })
+
+```
+
+# Pathway analyses
+
+## vizPathway function
+```{r}
+vizPathway = function(myID = "REAC:R-HSA-1640170", DBobjs=list(REAC, WP, CORUM), nMinGenes=5) {
+  #Combine pathway databases
+  DBobj = list()
+  DBobj$geneLists = list()
+  for (i in 1:length(DBobjs)) {
+    DBobj$geneLists = c(DBobj$geneLists, DBobjs[[i]]$geneLists)
+  }
+  DBobj$idNames = map(DBobjs, function(x) { x$idNames }) %>% bind_rows
+  
+  myGenes = DBobj$geneLists[[myID]]
+  myPathway = DBobj$idNames %>% filter(id==myID) %>% pull(description)
+  length(myPathway) == 1
+  myGenes = intersect(myGenes, colnames(cf))
+  # nMinGenes = 5
+  length(myGenes) > nMinGenes
+  D = cf %>% select(radialPosition, nUMIsPerCell, all_of(myGenes))
+  #colnames(D) = c("r", "ngc", "Nc")
+  
+  ngc = D[,3:ncol(D)] %>% apply(1, sum)
+  D = D %>% select(radialPosition, nUMIsPerCell) %>%
+    mutate(ngc=ngc) %>%
+    mutate(fEst=ngc/nUMIsPerCell)
+  
+  #TODO try averaging log expr instead, to quantify average reg of genes in that pathway
+  # D = D %>% pivot_longer(cols=D %>% select(-radialPosition, -nUMIsPerCell) %>% colnames,
+  #                    names_to = "gene", values_to = "ngc") %>% 
+  #   mutate(logExpr=log2((ngc+1)/nUMIsPerCell)) %>% select(-ngc) %>% 
+  #   pivot_wider(names_from="gene", values_from="logExpr")
+  # fEst = D[,3:ncol(D)] %>% apply(1, mean) 
+  # D = D %>% select(radialPosition, nUMIsPerCell) %>% 
+  #   mutate(fEst=fEst)
+  
+  yMin = D %>% pull(fEst) %>% quantile(.01)
+  yMax = D %>% pull(fEst) %>% quantile(.99)
+  # yMin = D %>% pull(fEst) %>% min
+  # yMax = D %>% pull(fEst) %>% max
+  ggplot(D, aes(x=radialPosition, y=fEst)) + geom_point(alpha=.1) + 
+    geom_smooth(color="#444444") +
+    labs(x="radial position", y="fractional abundance") +
+    ylim(yMin, yMax) +
+    #scale_y_log10() +
+    ggtitle(myPathway)
+  ggsave(sprintf("viewPathway_%s.pdf", myID), height=4, width=5)
+}
+```
+
+## DEPRECATED Visualize pathways
+```{r}
+fnByLocL[["periphery"]] %>% select(source, term_id, term_name, p_value) %>% unique() %>%
+  filter(source %in% c("CORUM", "REAC", "WP")) %>% arrange(p_value) %>% View()
+
+vizPathway("REAC:R-HSA-1640170") #cell cycle
+vizPathway("REAC:R-HSA-69239") #DNA synth
+vizPathway("REAC:R-HSA-73894") #DNA repair
+vizPathway("REAC:R-HSA-69580") #p53
+vizPathway("REAC:R-HSA-5357801") #programmed cell death
+vizPathway("REAC:R-HSA-1234174") #hypoxia
+vizPathway("REAC:R-HSA-2132295") #MHCII antigen presentation
+vizPathway("REAC:R-HSA-1236975") #antigen cross-presentation
+vizPathway("WP:WP3888") #VEGFA-VEGFR2 signaling
+vizPathway("WP:WP183") #Proteasome degradation
+vizPathway("WP:WP4313") #ferroptosis
+
+fnByLocL[["core"]] %>% select(source, term_id, term_name, p_value) %>% unique() %>%
+  filter(source %in% c("CORUM", "REAC", "WP")) %>% arrange(p_value) %>% View()
+
+map(c("REAC:R-HSA-9614085", "REAC:R-HSA-909733", "REAC:R-HSA-6783783", 
+      "REAC:R-HSA-170834", "REAC:R-HSA-400206", "REAC:R-HSA-9006936",
+      "REAC:R-HSA-1474244", "CORUM:5277", "REAC:R-HSA-174403", 
+      "WP:WP236", "WP:WP4239", "WP:WP4816", "WP:WP560"), vizPathway)
+
+fnByLocL[["intermediate"]] %>% select(source, term_id, term_name, p_value) %>% unique() %>%
+  filter(source %in% c("CORUM", "REAC", "WP")) %>% arrange(p_value) %>% View()
+
+map(c("CORUM:320" #55S ribosome, mitochondrial
+      #"CORUM:7421" #TSPY1-TSPYL5-USP7 complex -> cell proliferation
+), vizPathway)
+
+fnByLocL[["extrema"]] %>% select(source, term_id, term_name, p_value) %>% unique() %>%
+  filter(source %in% c("CORUM", "REAC", "WP")) %>% arrange(p_value) %>% View()
+
+map(c("WP:WP5347", #IL-26 signaling pathways
+#"WP:WP4754", #IL-18 signaling pathway
+#"WP:WP2435", #Quercetin and Nf-kB / AP-1 induced apoptosis
+"WP:WP5413", #IL-24 Signaling pathway
+#"WP:WP195", #IL-1
+"WP:WP5130" #Th17
+), vizPathway)
+
+```
+
+#DEPRECATED Alternative search for intermediate and extrema spatial genes
+
+## by genes
+```{r}
+# myGene = allGeneNames[1]
+# 
+# inOutExprT = future_map(allGeneNames, function(myGene){
+#   D = cf %>% select(radialPosition, all_of(myGene), nUMIsPerCell)
+#   colnames(D) = c("r", "ngc", "Nc")
+#   
+#   D = D %>% 
+#     mutate(fEst=ngc/Nc) %>% 
+#     mutate(log10fEst=log10(ngc/Nc + 1/Nc)) %>% 
+#     mutate(posBin=cut_interval(r, n=3, labels=c("in", "mid", "out")))
+#   D %>% ggplot(aes(x=posBin, y=r)) + geom_jitter()
+#   
+#   pIn = wilcox.test(D %>% filter(posBin == "in") %>% pull(log10fEst),
+#                     D %>% filter(posBin == "mid") %>% pull(log10fEst))$p.value
+#   pOut = wilcox.test(D %>% filter(posBin == "out") %>% pull(log10fEst),
+#                      D %>% filter(posBin == "mid") %>% pull(log10fEst))$p.value
+#   # pTot = 1 - (1-pIn) * (1-pOut)
+#   pTot = max(c(pIn, pOut))
+#   
+#   log10fcIn = ( D %>% filter(posBin == "in") %>% pull(log10fEst) %>% mean ) - 
+#     ( D %>% filter(posBin == "mid") %>% pull(log10fEst) %>% mean )
+#   log10fcOut = ( D %>% filter(posBin == "out") %>% pull(log10fEst) %>% mean ) - 
+#     ( D %>% filter(posBin == "mid") %>% pull(log10fEst) %>% mean )  
+#   tibble(gene=myGene, p=pTot, pIn=pIn, pOut=pOut, log10fcIn=log10fcIn, log10fcOut=log10fcOut)
+# }) %>% bind_rows()
+# write_rds(inOutExprT, "inOutExprT.rds")
+inOutExprT = read_rds("inOutExprT.rds")
+
+pAdjBH = p.adjust(c(inOutExprT %>% pull(pIn), 
+                    inOutExprT %>% pull(pOut)), method="BH")
+plot(c(inOutExprT %>% pull(pIn), 
+                    inOutExprT %>% pull(pOut)), 
+     pAdjBH)
+minfc = 1.1
+inOutExprT = inOutExprT %>%
+  mutate(qIn=pAdjBH[1:nrow(inOutExprT)], 
+         qOut=pAdjBH[nrow(inOutExprT) + (1:nrow(inOutExprT))]) %>%
+  mutate(q=ifelse(qIn>qOut, qIn, qOut)) %>% 
+  # mutate(q=fdrtool(p, statistic="pvalue")$qval) %>% 
+  mutate(isIntermediate=(q<.1 & (log10fcIn<log10(1/minfc)) & (log10fcOut<log10(1/minfc)) )) %>% 
+  mutate(isExtremum=(q<.1 & (log10fcIn>log10(minfc)) & (log10fcOut>log10(minfc)) )) %>% 
+  mutate(isCore=(q<.1 & (log10fcIn>log10(minfc) | log10fcOut<log10(1/minfc)) & 
+                   !isIntermediate & !isExtremum)) %>%
+  mutate(isPeriphery=(q<.1 & (log10fcIn<log10(1/minfc) | log10fcOut>log10(minfc)) &
+                        !isIntermediate & !isExtremum)) %>% 
+  inner_join(allIntcptSlopes %>% filter(toReport) %>% select(gene))
+
+inOutExprT %>% pull(isIntermediate) %>% sum
+inOutExprT %>% pull(isExtremum) %>% sum
+inOutExprT %>% 
+  mutate(mlog10q=-log10(q)) %>% 
+  #filter(p<.01) %>% 
+  ggplot(aes(x=log10fcIn, y=log10fcOut, color=mlog10q)) +
+  geom_point()
+
+nGenesByType = 
+  inOutExprT %>% 
+  select(isIntermediate, isExtremum, isCore, isPeriphery) %>% 
+  apply(2, sum)
+nGenesByType
+#Other genes
+nrow(inOutExprT %>% filter(q<.1)) - sum(nGenesByType)
+
+inOutExprT %>% filter(q<.1) %>% View()
+
+
+```
+
+Conclusion: evidence for hundreds of extrema and intermediately expressed genes with this approach
+### visualize genes
+```{r}
+inOutExprT %>%
+  filter(isExtremum | isIntermediate) %>% 
+  pull(gene) %>% 
+  map(function(myGene) {
+    D = cf %>% select(radialPosition, myGene, nUMIsPerCell)
+    colnames(D) = c("r", "ngc", "Nc")
+    D = D %>% mutate(fEst=ngc/Nc)
+    
+    # myTheta =
+    #   allIntcptSlopes %>% filter(gene==myGene) %>% select(a,b,c,size) %>% unlist()
+    # names(myTheta) = names(myTheta) %>% str_replace("\\..*$", "")
+    # fittedT = tibble(r=seq(0,maxRthresh,len=100)) %>%
+    #   mutate(f=fg(r, myTheta))
+    
+    yMax = D %>% pull(fEst) %>% quantile(.99)
+    ggplot(D) + geom_point(aes(x=r, y=fEst), alpha=.1) + geom_smooth(aes(x=r, y=fEst), color="#444444") +
+      # geom_line(aes(x=r, y=f), color="#FF5555", data=fittedT) + 
+      labs(x="radial position", y="fractional abundance") +
+      ylim(0, yMax) +
+      # scale_y_log10() +
+      ggtitle(myGene)
+    ggsave(sprintf("viewGene_periInterm_%s.pdf", myGene), height=2, width=2.5)
+  })
+```
+
+
+### make four panels for 4 classes of genes
+```{r}
+geneLists = 
+  list(extremum=inOutExprT %>% filter(isExtremum),
+       intermediate=inOutExprT %>% filter(isIntermediate),
+       core=inOutExprT %>% filter(isCore),
+       periphery=inOutExprT %>% filter(isPeriphery))
+geneType = "periphery"
+map(names(geneLists), 
+    function(geneType) {
+      geneT = geneLists[[geneType]]      
+      myGenes = geneT %>% arrange(q) %>% head(5) %>% pull(gene)
+      toPlotT = 
+        map(myGenes, function(myGene) {
+          cat(sprintf("Processing %s\n", myGene))
+          D = cf %>% select(radialPosition, myGene, nUMIsPerCell)
+          colnames(D) = c("r", "ngc", "Nc")
+          myTheta = 
+            allIntcptSlopes %>% filter(gene==myGene) %>% select(a,b,c,size) %>% unlist()
+          names(myTheta) = names(myTheta) %>% str_replace("\\..*$", "")
+          
+          fFit = tibble(r=seq(0,maxRthresh,len=100)) %>% 
+            mutate(f=fg(r, myTheta)) %>%  #%>% ggplot(aes(x=r, y=f)) + geom_line()
+            mutate(log10f = log10(f))
+          return(fFit %>% mutate(gene=myGene))
+          
+          #alterrnative to return for smoothing with geom_smooth()
+          D = D %>% 
+            mutate(f=ngc/Nc) %>% 
+            mutate(log10f=log10(ngc/Nc + 1/Nc))
+          # return(D %>% mutate(gene=myGene))
+          
+        }) %>% bind_rows()
+      ggplot(toPlotT, aes(x=r, y=f, group=gene, color=gene)) + 
+        geom_line() +
+        # geom_smooth() +
+        scale_y_log10() +
+        labs(x="radial position", y="fractional abundance")
+      ggsave(sprintf("viewGenes_%s.pdf", geneType), height=3, width=4.5)
+    })
+    
+) %>% pull(gene) %>% 
+  map(function(myGene) {
+    
+    try({
+      D %>% 
+        ggplot(aes(x=r, y=fEst)) + geom_point(alpha=.2) + 
+        #geom_smooth() + 
+        #geom_density_2d() +
+        geom_line(aes(y=f, color="red"), data=fFit) + #scale_y_log10() +
+        ggtitle(sprintf("%s, q = %.2e, L=%.1f", myGene, 
+                        allIntcptSlopes %>% filter(gene==myGene) %>% pull(q),
+                        allIntcptSlopes %>% filter(gene==myGene) %>% pull(L)))
+      ggsave(sprintf("%s_rVsF_fitted.pdf", myGene), height=3, width=4)
+    })
+    
+    D %>% 
+      ggplot(aes(x=r, y=log10fEst)) + geom_point(alpha=.2) + #geom_smooth() + 
+      #geom_density_2d() +
+      geom_line(aes(y=log10f, color="red"), data=fFit) + #scale_y_log10() +
+      ggtitle(sprintf("%s, q = %.2e, L=%.1f", myGene, 
+                      allIntcptSlopes %>% filter(gene==myGene) %>% pull(q),
+                      allIntcptSlopes %>% filter(gene==myGene) %>% pull(L)))
+    ggsave(sprintf("%s_rVsF_log10fitted.pdf", myGene), height=3, width=4)
+    
+    if ( myGene %in% c() ) {
+       D %>% 
+        ggplot(aes(x=r, y=fEst)) + geom_point() + #geom_smooth() + 
+        geom_line(aes(y=f, color="red"), data=fFit) + #scale_y_log10() +
+        ggtitle(sprintf("%s, q = %.2e, L=%.1f", myGene, 
+                        allIntcptSlopes %>% filter(gene==myGene) %>% pull(q),
+                        allIntcptSlopes %>% filter(gene==myGene) %>% pull(L)      
+        ))
+    }
+  })
+
+
+  pull(gene) %>% 
+  map(function(myGene) {
+    D = cf %>% select(radialPosition, myGene, nUMIsPerCell)
+    colnames(D) = c("r", "ngc", "Nc")
+    D = D %>% mutate(fEst=ngc/Nc)
+    
+    # myTheta =
+    #   allIntcptSlopes %>% filter(gene==myGene) %>% select(a,b,c,size) %>% unlist()
+    # names(myTheta) = names(myTheta) %>% str_replace("\\..*$", "")
+    # fittedT = tibble(r=seq(0,maxRthresh,len=100)) %>%
+    #   mutate(f=fg(r, myTheta))
+    
+    yMax = D %>% pull(fEst) %>% quantile(.99)
+    ggplot(D) + geom_point(aes(x=r, y=fEst), alpha=.1) + geom_smooth(aes(x=r, y=fEst), color="#444444") +
+      # geom_line(aes(x=r, y=f), color="#FF5555", data=fittedT) + 
+      labs(x="radial position", y="fractional abundance") +
+      ylim(0, yMax) +
+      # scale_y_log10() +
+      ggtitle(myGene)
+    ggsave(sprintf("viewGene_periInterm_%s.pdf", myGene), height=2, width=2.5)
+  })
+
+```
+
+
+## by pathways
+```{r}
+DBobjs=list(REAC, WP, CORUM)
+nMinGenes=5
+
+DBobj = list()
+DBobj$geneLists = list()
+for (i in 1:length(DBobjs)) {
+  DBobj$geneLists = c(DBobj$geneLists, DBobjs[[i]]$geneLists)
+}
+DBobj$idNames = map(DBobjs, function(x) { x$idNames }) %>% bind_rows
+
+pathwayExtrInterT = future_map(names(DBobj$geneLists), function(myID) {
+  myGenes = DBobj$geneLists[[myID]]
+  myPathway = DBobj$idNames %>% filter(id==myID) %>% pull(description)
+  myGenes = intersect(myGenes, colnames(cf))
+  # nMinGenes = 5
+  if ( length(myPathway) != 1 || length(myGenes) <= nMinGenes ) { 
+    return(tibble(pathway=myID, p=NA, log10fcIn=NA, log10fcOut=NA)) 
+  }
+
+  D = cf %>% select(radialPosition, nUMIsPerCell, all_of(myGenes))
+  
+  ngc = D[,3:ncol(D)] %>% apply(1, sum)
+  D = D %>% select(radialPosition, nUMIsPerCell) %>%
+    mutate(ngc=ngc) %>%
+    mutate(fEst=ngc/nUMIsPerCell) %>% 
+    mutate(log10fEst=log10(ngc/nUMIsPerCell + 1/nUMIsPerCell))
+  
+  D = D %>% 
+    #mutate(posBin=cut_interval(radialPosition, n=3, labels=c("in", "mid", "out")))
+    mutate(posBin=cut_interval(radialPosition, n=3, labels=c("in", "mid", "out")))
+  #D %>% ggplot(aes(x=posBin, y=radialPosition)) + geom_jitter()
+  
+  pIn = wilcox.test(D %>% filter(posBin == "in") %>% pull(log10fEst),
+                    D %>% filter(posBin == "mid") %>% pull(log10fEst))$p.value
+  pOut = wilcox.test(D %>% filter(posBin == "out") %>% pull(log10fEst),
+                     D %>% filter(posBin == "mid") %>% pull(log10fEst))$p.value
+  pTot = 1 - (1-pIn) * (1-pOut)
+  
+  log10fcIn = ( D %>% filter(posBin == "in") %>% pull(log10fEst) %>% mean ) - 
+    ( D %>% filter(posBin == "mid") %>% pull(log10fEst) %>% mean )
+  log10fcOut = ( D %>% filter(posBin == "out") %>% pull(log10fEst) %>% mean ) - 
+    ( D %>% filter(posBin == "mid") %>% pull(log10fEst) %>% mean )  
+  tibble(pathway=myID, p=pTot, log10fcIn=log10fcIn, log10fcOut=log10fcOut)
+}) %>% bind_rows()
+
+write_rds(pathwayExtrInterT, "pathwayExtrInterT.rds")
+```
+
+### visualize pathways
+```{r}
+pathwayExtrInterT = read_rds("pathwayExtrInterT.rds")
+minfc = 1.1
+pathwayExtrInterT = pathwayExtrInterT %>% 
+  drop_na() %>% 
+  mutate(q=fdrtool(p, statistic="pvalue")$qval) %>% 
+  mutate(isIntermediate=(q<.1 & (log10fcIn<log10(1/minfc)) & (log10fcOut<log10(1/minfc)) )) %>% 
+  mutate(isExtremum=(q<.1 & (log10fcIn>log10(minfc)) & (log10fcOut>log10(minfc)) )) %>% 
+  mutate(isCore=(q<.1 & (log10fcIn>log10(minfc) | log10fcOut<log10(1/minfc)) & 
+                   !isIntermediate & !isExtremum)) %>%
+  mutate(isPeriphery=(q<.1 & (log10fcIn<log10(1/minfc) | log10fcOut>log10(minfc)) &
+                        !isIntermediate & !isExtremum))
+
+nPathwaysByType = 
+  pathwayExtrInterT %>% 
+  select(isIntermediate, isExtremum, isCore, isPeriphery) %>% 
+  apply(2, sum)
+#Other genes
+nrow(pathwayExtrInterT %>% filter(q<.1)) - sum(nPathwaysByType)
+
+pathwayExtrInterT %>% pull(isIntermediate) %>% sum
+pathwayExtrInterT %>% pull(isExtremum) %>% sum
+pathwayExtrInterT %>% 
+  mutate(mlog10q=-log10(q)) %>% 
+  #filter(p<.01) %>% 
+  ggplot(aes(x=log10fcIn, y=log10fcOut, color=mlog10q)) +
+  geom_point()
+
+# pathwayExtrInterT %>% 
+#   filter(q<.1) %>% 
+#   rename(id="pathway") %>% 
+#   inner_join(DBobj$idNames) %>% 
+#   View()
+
+pathwayExtrInterT %>% #intermediate
+  filter(q<.1) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% 
+  filter(isIntermediate) %>% 
+  View()
+pathwayExtrInterT %>% #intermediate
+  filter(q<.1) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% 
+  filter(isIntermediate) %>% 
+  pull(id) %>% 
+  map(function(pID) {
+    vizPathway(pID)
+  })
+
+pathwayExtrInterT %>% #Extrema
+  filter(q<.1) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% 
+  filter(isExtremum) %>% 
+  View()
+pathwayExtrInterT %>% #extrema
+  filter(q<.1) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% 
+  filter(isExtremum) %>% 
+  pull(id) %>% 
+  map(function(pID) {
+    vizPathway(pID)  
+  })
+
+pathwayExtrInterT %>% #periphery
+  filter(q<.1) %>% 
+  filter(log10fcIn<0 & log10fcOut>0) %>% 
+  arrange(desc(log10fcOut)) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% View
+vizPathway("REAC:R-HSA-2559584") #senecence
+vizPathway("REAC:R-HSA-2559586") #senecence
+vizPathway("REAC:R-HSA-888590") #gaba
+vizPathway("REAC:R-HSA-9613354") #Lipophagy
+vizPathway("REAC:R-HSA-2162123") #prostaglandin
+vizPathway("CORUM:5268") #TNFa complex
+vizPathway("REAC:R-HSA-1640170") #cell cycle
+vizPathway("REAC:R-HSA-69306") #DNA
+vizPathway("WP:WP2359") #proteosome
+vizPathway("WP:WP3527") #pre-impl embryo
+vizPathway("REAC:R-HSA-1234174") # response to hypoxia
+
+pathwayExtrInterT %>% #core
+  filter(q<.1) %>% 
+  filter(log10fcIn>0 & log10fcOut<0) %>% 
+  arrange(desc(log10fcIn)) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% View
+
+vizPathway("REAC:R-HSA-166786") #C2 C4
+vizPathway("WP:WP453") #inflam response
+vizPathway("REAC:R-HSA-909733") #interferon
+vizPathway("REAC:R-HSA-1566977") #ECM
+vizPathway("REAC:R-HSA-2243919") #collagen crosslinking
+vizPathway("REAC:R-HSA-354192") #integrin
+vizPathway("WP:WP4239") #EMT
+vizPathway("REAC:R-HSA-8875878") #motility
+vizPathway("REAC:R-HSA-9754189") #germ layer gastrulation
+vizPathway("REAC:R-HSA-9796292") #axial mesoderm
+vizPathway("WP:WP3874") #tgfb
+
+```
+# Find pathways whose spatial distribution is non-uniform
+
+```{r}
+
+myID = names(DBobj$geneLists)[467]
+pathwayHavgR = future_map(names(DBobj$geneLists), function(myID) {
+  myGenes = DBobj$geneLists[[myID]]
+  myPathway = DBobj$idNames %>% filter(id==myID) %>% pull(description)
+  myGenes = intersect(myGenes, colnames(cf))
+  # nMinGenes = 5
+  emptyRes = tibble(pathway=myID, H=NA, avgR=NA, xiP=NA, xiPub=NA,
+                    pIn=NA, pOut=NA, log10fcIn=NA, log10fcOut=NA)
+
+  if ( length(myPathway) != 1 || length(myGenes) <= nMinGenes ) {
+    return(emptyRes)
+  }
+
+  D = cf %>% select(radialPosition, nUMIsPerCell, all_of(myGenes))
+  ngc = D[,3:ncol(D)] %>% apply(1, sum)
+
+  if ( sum(ngc) < length(ngc) ) {
+    return(emptyRes)
+  }
+
+  D = D %>% select(radialPosition, nUMIsPerCell) %>%
+    mutate(ngc=ngc) %>%
+    mutate(fEst=ngc/nUMIsPerCell) %>%
+    mutate(log10fEst=log10(ngc/nUMIsPerCell + 1/nUMIsPerCell)) %>% 
+   mutate(posBin=cut_interval(radialPosition, n=3, labels=c("in", "mid", "out")))
+
+  pIn = wilcox.test(D %>% filter(posBin == "in") %>% pull(log10fEst),
+                    D %>% filter(posBin == "mid") %>% pull(log10fEst))$p.value
+  pOut = wilcox.test(D %>% filter(posBin == "out") %>% pull(log10fEst),
+                     D %>% filter(posBin == "mid") %>% pull(log10fEst))$p.value
+  
+  log10fcIn = ( D %>% filter(posBin == "in") %>% pull(log10fEst) %>% mean ) -
+    ( D %>% filter(posBin == "mid") %>% pull(log10fEst) %>% mean )
+  log10fcOut = ( D %>% filter(posBin == "out") %>% pull(log10fEst) %>% mean ) -
+    ( D %>% filter(posBin == "mid") %>% pull(log10fEst) %>% mean )
+
+  #unbinned expression - space association quantification
+  xiPub = xicor(D %>% pull(fEst), D %>% pull(radialPosition), pvalue=T)$pval
+
+  D = D %>%
+    #mutate(posBin=cut_interval(radialPosition, n=3, labels=c("in", "mid", "out")))
+    mutate(posBin=cut(radialPosition, breaks=seq(0, 1, by=.1)))
+  fByBin = D %>%
+    group_by(posBin) %>%
+    summarize(fEst=mean(fEst), n=n())
+  fByBin0 = fByBin %>% mutate(fEst=fEst / sum(fEst))
+  fEstV = fByBin0 %>% pull(fEst)
+  H = - sum( fEstV * log(fEstV) )
+  avgR = sum( seq(0, 1, len=length(fEstV)) * fEstV )
+  xiP = xicor(fEstV, seq(0, 1, len=length(fEstV)), pvalue = T)$pval
+  #D %>% ggplot(aes(x=posBin, y=radialPosition)) + geom_jitter()
+
+  tibble(pathway=myID, H=H, avgR=avgR, xiP=xiP, xiPub=xiPub,
+         pIn=pIn, pOut=pOut, log10fcIn=log10fcIn, log10fcOut=log10fcOut)
+}, .options=furrr_options(seed=T)) %>% bind_rows()
+
+write_rds(pathwayHavgR, "pathwayHavgR.rds")
+```
+
+### test for spatial pathways
+```{r}
+pathwayHavgR = read_rds("pathwayHavgR.rds") #%>%select(pathway, H, avgR)
+pathwayHavgR =
+  pathwayHavgR %>% 
+  drop_na() %>% 
+  mutate(xiQ=p.adjust(xiP, method="BH")) %>% 
+  mutate(xiQub=p.adjust(xiPub, method="BH")) 
+
+#210 spatial pathways
+pathwayHavgR %>% filter(xiQub<.1) %>% drop_na() %>% nrow
+
+# ggplot(pathwayHavgR) +
+#   geom_point(aes(x=avgR, y=H))
+ggplot(pathwayHavgR) +
+  geom_point(aes(x=avgR, y=xiQ)) #+ scale_y_log10()
+ggplot(pathwayHavgR) +
+  geom_point(aes(x=avgR, y=xiQub)) +
+  scale_y_log10()
+
+# fish out extrema and intermediate pathways
+pAdjBH = p.adjust(c(pathwayHavgR %>% pull(pIn), 
+                    pathwayHavgR %>% pull(pOut)), method="BH")
+plot(c(pathwayHavgR %>% pull(pIn), 
+       pathwayHavgR %>% pull(pOut)), 
+     pAdjBH)
+
+minfc = 1.15
+pathwayHavgR = pathwayHavgR %>%
+  mutate(qIn=pAdjBH[1:nrow(pathwayHavgR)], 
+         qOut=pAdjBH[nrow(pathwayHavgR) + (1:nrow(pathwayHavgR))]) %>%
+  mutate(q=ifelse(qIn>qOut, qIn, qOut)) %>% 
+  mutate(isIntermediate=(q<.1 & (log10fcIn<log10(1/minfc)) & (log10fcOut<log10(1/minfc)) )) %>% 
+  mutate(isExtremum=(q<.1 & (log10fcIn>log10(minfc)) & (log10fcOut>log10(minfc)) )) %>% 
+  mutate(isCore=(q<.1 & (log10fcIn>log10(minfc) | log10fcOut<log10(1/minfc)) & 
+                   !isIntermediate & !isExtremum)) %>%
+  mutate(isPeriphery=(q<.1 & (log10fcIn<log10(1/minfc) | log10fcOut>log10(minfc)) &
+                        !isIntermediate & !isExtremum))
+
+
+# nPathwaysByType
+pathwayHavgR %>% 
+  filter(q<.1) %>% 
+  select(isIntermediate, isExtremum, isCore, isPeriphery) %>% 
+  apply(2, sum)
+
+pathwayHavgR %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>%
+  filter(xiQub<0.1) %>% 
+  arrange(avgR) %>% 
+  select(id, description, avgR, xiQub) %>% 
+  rename(q=xiQub) %>% 
+  write_csv("spatialPathways.csv")
+```
+
+### visualize spatial pathways from 2nd order location analysis
+```{r}
+toShow = 
+  list("core"=c("KEGG:04140", "REAC:R-HSA-909733", "REAC:R-HSA-556833", "KEGG:04350"), #, "KEGG:04668"),
+       "periphery"=c("REAC:R-HSA-1640170", "REAC:R-HSA-2559583", "REAC:R-HSA-194138"),
+       "intermediate"=c("REAC:R-HSA-1234174"),
+       "extraCore"=c("REAC:R-HSA-166786", "REAC:R-HSA-1566977", "REAC:R-HSA-354192", "WP:WP4239", "REAC:R-HSA-9754189"),
+       "extraPeri"=c("WP:WP3527", "REAC:R-HSA-2559584", "REAC:R-HSA-450341"),
+       "extraCustom"=c("KEGG:04218", "REAC:R-HSA-2559582", #cellular senescence, SASP
+                       "REAC:R-HSA-5693567", "REAC:R-HSA-5693532")) #HDR, dsDNA brerak repair
+myLoc = "extraPeri"
+tibble(id=toShow[[myLoc]]) %>% inner_join(DBobj$idNames)
+for (myLoc in names(toShow)) {
+  myID = "KEGG:04140"
+  pathExprRadialPosT = 
+    toShow[[myLoc]] %>% map(function(myID) {
+      myGenes = DBobj$geneLists[[myID]]
+      myPathway = DBobj$idNames %>% filter(id==myID) %>% pull(description)
+      myGenes = intersect(myGenes, colnames(cf))
+      
+      D = cf %>% select(radialPosition, nUMIsPerCell, all_of(myGenes))
+      
+      ngc = D[,3:ncol(D)] %>% apply(1, sum)
+      D = D %>% select(radialPosition, nUMIsPerCell) %>%
+        mutate(ngc=ngc) %>%
+        mutate(fEst=ngc/nUMIsPerCell) %>% 
+        mutate(log10fEst=log10(ngc/nUMIsPerCell + 1/median(nUMIsPerCell)))
+      tibble(D %>% mutate(pathway=myPathway))
+    }) %>% bind_rows()
+  
+  pathExprRadialPosT =
+    inner_join(
+    pathExprRadialPosT,
+    pathExprRadialPosT %>% 
+      group_by(pathway) %>% 
+      summarize(avgExpr=mean(log10fEst))  
+  ) %>% 
+    mutate(pathway=str_trunc(pathway, 25)) %>% 
+    mutate(pathway=fct_reorder(pathway, -avgExpr))
+  
+  ggplot(pathExprRadialPosT, 
+    aes(x=radialPosition, y=log2(10^(log10fEst-avgExpr)), group=pathway, color=pathway)) +
+    geom_smooth() +
+    labs(x="radial position", y="log2 fold change")
+  ggsave(sprintf("vizPathway_%s.pdf", myLoc), height=2, width=5)
+}
+```
+### Repeat upon down-sampling
+
+```{r}
+cfDS = downSample(cf, pD = .03)
+
+```
+
+
+
+### NOT NEEDED same visu but with binning instead of smoothing
+
+```{r}
+
+myLoc = "core"
+for (myLoc in names(toShow)) {
+  myID = "KEGG:04140"
+  pathExprRadialPosT = 
+    toShow[[myLoc]] %>% map(function(myID) {
+      myGenes = DBobj$geneLists[[myID]]
+      myPathway = DBobj$idNames %>% filter(id==myID) %>% pull(description)
+      myGenes = intersect(myGenes, colnames(cf))
+      
+      D = cf %>% select(radialPosition, nUMIsPerCell, all_of(myGenes))
+      
+      ngc = D[,3:ncol(D)] %>% apply(1, sum)
+      D = D %>% select(radialPosition, nUMIsPerCell) %>%
+        mutate(ngc=ngc) %>%
+        mutate(fEst=ngc/nUMIsPerCell) %>% 
+        mutate(log10fEst=log10(ngc/nUMIsPerCell + 1/median(nUMIsPerCell)))
+      
+      D = D %>% 
+       mutate(posBin=cut(radialPosition, breaks=seq(0, 1, by=.1)))
+      fByBin = D %>% 
+         group_by(posBin) %>% 
+         summarize(avgF=mean(fEst), SD=sd(fEst), n=n()) %>% 
+         mutate(SE=SD/sqrt(n))
+      
+      tibble(fByBin %>% mutate(pathway=myPathway))
+      
+    }) %>% bind_rows()
+  
+  pathExprRadialPosT =
+    inner_join(
+    pathExprRadialPosT,
+    pathExprRadialPosT %>% 
+      group_by(pathway) %>% 
+      summarize(avgExpr=mean(avgF))  
+  ) %>% 
+    mutate(pathway=str_trunc(pathway, 25)) %>% 
+    mutate(pathway=fct_reorder(pathway, -avgExpr))
+  
+  # ggplot(fByBin, aes(x=, y=avgF)) + 
+      #   # geom_point(alpha=.3) + 
+      #   geom_point() + #+ scale_y_log10()
+      #   geom_errorbar(aes(ymin=avgF-SE, ymax=avgF+SE), width=.2) +
+      #   ggtitle(DBobj$idNames %>% filter(id==myID) %>% pull(description)) %>% 
+      #   print
+  ggplot(pathExprRadialPosT, 
+    aes(x=posBin, y=avgF/avgExpr, group=pathway, color=pathway)) +
+    geom_line() +
+    # geom_errorbar(aes(ymin=avgF-SE, ymax=avgF+SE), width=.2) +
+    scale_y_log10() +
+    labs(x="radial position", y="fractional abundance") 
+      
+  ggsave(sprintf("vizPathway_binned_%s.pdf", myLoc), height=2, width=5)
+}
+
+
+
+```
+
+### visualize spatial pathways from xicor analysis
+```{r}
+myID = "REAC:R-HSA-9690406"
+myIDs =
+  c(pathwayHavgR %>% filter(xiQ<0.1) %>% arrange(avgR) %>% pull(pathway) %>% .[1:5],
+    pathwayHavgR %>% filter(xiQ<0.1) %>% arrange(desc(avgR)) %>% pull(pathway) %>% .[1:5],
+    # pathwayHavgR %>% filter(xiQ<0.1) %>% mutate(midPeak=abs(avgR-.5)) %>% arrange(midPeak) %>% pull(pathway) %>% .[1:5],
+    pathwayHavgR %>% filter(isIntermediate) %>% arrange(q) %>% pull(pathway) %>% .[1:10],
+    pathwayHavgR %>% filter(isExtremum) %>% arrange(q) %>% pull(pathway) %>% .[1:10],
+    "REAC:R-HSA-166786", "REAC:R-HSA-1566977", "REAC:R-HSA-354192", "REAC:R-HSA-909733",
+    "WP:WP4239", "REAC:R-HSA-2559586", "WP:WP3527", "REAC:R-HSA-2559584", "REAC:R-HSA-450341") %>% 
+  unique()
+
+map(myIDs, function(myID) {
+  myGenes = DBobj$geneLists[[myID]]
+  myPathway = DBobj$idNames %>% filter(id==myID) %>% pull(description)
+  myGenes = intersect(myGenes, colnames(cf))
+  # nMinGenes = 5
+  if ( length(myPathway) != 1 || length(myGenes) <= nMinGenes ) { 
+    return(tibble(pathway=myID, p=NA, log10fcIn=NA, log10fcOut=NA)) 
+  }
+
+  D = cf %>% select(radialPosition, nUMIsPerCell, all_of(myGenes))
+  
+  ngc = D[,3:ncol(D)] %>% apply(1, sum)
+  D = D %>% select(radialPosition, nUMIsPerCell) %>%
+    mutate(ngc=ngc) %>%
+    mutate(fEst=ngc/nUMIsPerCell) %>% 
+    mutate(log10fEst=log10(ngc/nUMIsPerCell + 1/nUMIsPerCell))
+  
+  D = D %>% 
+    #mutate(posBin=cut_interval(radialPosition, n=3, labels=c("in", "mid", "out")))
+    mutate(posBin=cut(radialPosition, breaks=seq(0, 1, by=.1)))
+  fByBin = D %>% 
+    group_by(posBin) %>% 
+    summarize(avgF=mean(fEst), SD=sd(fEst), n=n()) %>% 
+    mutate(SE=SD/sqrt(n))
+  
+  # ggplot(fByBin, aes(x=posBin, y=avgF)) + 
+  #   # geom_point(alpha=.3) + 
+  #   geom_point() + #+ scale_y_log10()
+  #   geom_errorbar(aes(ymin=avgF-SE, ymax=avgF+SE), width=.2) +
+  #   ggtitle(DBobj$idNames %>% filter(id==myID) %>% pull(description)) %>% 
+  #   print
+  
+  ggplot(D, aes(x=radialPosition, y=fEst)) + 
+  #   # geom_point(alpha=.3) + 
+     geom_smooth() + #+ scale_y_log10()
+     ggtitle(DBobj$idNames %>% filter(id==myID) %>% pull(description)) %>% 
+     print
+})
+```
+```{r}
+# analysis whose purpose I don't remember
+minfc = 1.1
+pathwayExtrInterT = pathwayExtrInterT %>% 
+  drop_na() %>% 
+  mutate(q=fdrtool(p, statistic="pvalue")$qval) %>% 
+  mutate(isIntermediate=(q<.1 & (log10fcIn<log10(1/minfc)) & (log10fcOut<log10(1/minfc)) )) %>% 
+  mutate(isExtremum=(q<.1 & (log10fcIn>log10(minfc)) & (log10fcOut>log10(minfc)) )) %>% 
+  mutate(isCore=(q<.1 & (log10fcIn>log10(minfc) | log10fcOut<log10(1/minfc)) & 
+                   !isIntermediate & !isExtremum)) %>%
+  mutate(isPeriphery=(q<.1 & (log10fcIn<log10(1/minfc) | log10fcOut>log10(minfc)) &
+                        !isIntermediate & !isExtremum))
+
+nPathwaysByType = 
+  pathwayExtrInterT %>% 
+  select(isIntermediate, isExtremum, isCore, isPeriphery) %>% 
+  apply(2, sum)
+#Other genes
+nrow(pathwayExtrInterT %>% filter(q<.1)) - sum(nPathwaysByType)
+
+pathwayExtrInterT %>% pull(isIntermediate) %>% sum
+pathwayExtrInterT %>% pull(isExtremum) %>% sum
+pathwayExtrInterT %>% 
+  mutate(mlog10q=-log10(q)) %>% 
+  #filter(p<.01) %>% 
+  ggplot(aes(x=log10fcIn, y=log10fcOut, color=mlog10q)) +
+  geom_point()
+
+# pathwayExtrInterT %>% 
+#   filter(q<.1) %>% 
+#   rename(id="pathway") %>% 
+#   inner_join(DBobj$idNames) %>% 
+#   View()
+
+pathwayExtrInterT %>% #intermediate
+  filter(q<.1) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% 
+  filter(isIntermediate) %>% 
+  View()
+pathwayExtrInterT %>% #intermediate
+  filter(q<.1) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% 
+  filter(isIntermediate) %>% 
+  pull(id) %>% 
+  map(function(pID) {
+    vizPathway(pID)
+  })
+
+pathwayExtrInterT %>% #Extrema
+  filter(q<.1) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% 
+  filter(isExtremum) %>% 
+  View()
+pathwayExtrInterT %>% #extrema
+  filter(q<.1) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% 
+  filter(isExtremum) %>% 
+  pull(id) %>% 
+  map(function(pID) {
+    vizPathway(pID)  
+  })
+
+pathwayExtrInterT %>% #periphery
+  filter(q<.1) %>% 
+  filter(log10fcIn<0 & log10fcOut>0) %>% 
+  arrange(desc(log10fcOut)) %>% 
+  rename(id="pathway") %>% 
+  inner_join(DBobj$idNames) %>% View
+vizPathway("REAC:R-HSA-2559584") #senecence
+```
+
+# dimensionality of gene expression
+```{r}
+cf[,6:(ncol(cf)-1)] %>% dim
+
+hist(log10(nUMIsPerCell), 20)
+
+keptCells = nUMIsPerCell > 50000
+#6:(ncol(cf)-1)
+logTPMs = apply(cf[keptCells,myGenes], 1, function(x) {
+   log10( x/sum(x) + 1/median(nUMIsPerCell[keptCells]) )
+}) %>% t
+
+dim(logTPMs)
+logTPMs[1:5,1:5]
+dudi1 = dudi.pca(logTPMs, center=T, scale=F, nf = 10, scannf=F)
+
+totVar = sum( apply(logTPMs, 2, var) )
+(dudi1$eig[1:10] / totVar) %>% barplot
+length(dudi1$eig)
+
+geneExprPos = dudi1$li[,1:10] %>% 
+  mutate(radialPosition=cf[keptCells,] %>% pull(radialPosition))
+
+geneExprPos %>% 
+  ggplot(aes(x=Axis1, y=Axis2)) +
+  geom_point(alpha=.1) +
+  geom_density2d(bins=4) #+ xlim(-20, 25) + ylim(-20, 30)
+ggsave("PCAgeneExpr.pdf", height=2.5, width=3)
+
+geneExprPos %>% 
+  ggplot(aes(x=Axis1, y=Axis4)) +
+  geom_point(aes(color=radialPosition))
+
+plot_ly(geneExprPos, x=~Axis1, y=~Axis2, z=~Axis3,
+        color=~radialPosition, size=1) %>% add_markers()
+
+regular_grid <- 
+  expand_grid(x = seq(min(geneExprPos$Axis1), 
+                      max(geneExprPos$Axis1),
+                      length.out = 100),
+              y = seq(min(geneExprPos$Axis2), 
+                      max(geneExprPos$Axis2), 
+                      length.out = 100))
+```
+
+
+```{r}
+# Define a function to compute Gaussian smoothed estimate for each point
+gaussian_smooth_estimate <- function(x, y, df) {
+  # Calculate distances of each data point from (x, y)
+  distances <- sqrt((df$Axis1 - x)^2 + (df$Axis2 - y)^2)
+  
+  # Calculate weights using Gaussian kernel
+  weights <- dnorm(distances, mean = 0, sd = 2)  # Adjust sd as needed
+  
+  # Compute the weighted sum of z values
+  z_estimate <- sum(weights * df$radialPosition) / sum(weights)
+  if ( sum(weights) < 1 ) return(NA)
+  
+  return(z_estimate)
+}
+
+# Apply the function to each point in the grid
+regular_grid_with_z <- regular_grid %>%
+  mutate(z = map2_dbl(x, y, ~gaussian_smooth_estimate(.x, .y, geneExprPos),
+                      .progress = T))
+summary(regular_grid_with_z %>% pull(z))
+
+geneExprPos %>% 
+  ggplot() +
+  geom_point(aes(x=Axis1, y=Axis2, color=radialPosition)) +
+  geom_contour(aes(x=x, y=y, z=z), 
+               breaks=c(0., .25, .5, .75, 1), 
+               data=regular_grid_with_z) +
+  xlim(-20, 30) + ylim(-20, 30)
+```
+Conclusion: gene expersion is 1D, suggests just 2 environments
+perhaps the 3rd environment is weak.
+Radial position - gene expression association is quite noisy
+
+```{r}
+# ggplot(regular_grid_with_z) +
+#   geom_contour(aes(x=x, y=y, z=z))
+dudi1$co[,1:2] %>% arrange(desc(Comp1)) %>% .[1:30,]
+dudi1$co[,1:2] %>% arrange(desc(Comp2)) %>% .[1:30,]
+
+umap1 = umap(dudi1$li)
+tibble(Axis1=umap1$layout[,1],
+       Axis2=umap1$layout[,2]) %>% 
+  mutate(radialPosition=cf %>% pull(radialPosition)) %>% 
+  ggplot(aes(x=Axis1, y=Axis2, color=radialPosition)) +
+  geom_point()
+```
+
+# Compare gene expression of 2D and 3D-grown cells
+
+## Load and filter genes and cells
+```{r}
+# allCounts = read_tsv("countMatrix.tsv")
+# dim(allCounts)
+# allGeneNames = allCounts %>% pull("GeneID")
+# nUMIsPerGene = apply(allCounts %>% select(-GeneID), 1, sum) #UMIs per gene
+# nCells = ncol(allCounts)
+# nUMIsPerCell = apply(allCounts %>% select(-GeneID), 2, sum) #UMIs per cell
+# 
+# allCountsMat = as.matrix(allCounts %>% select(-GeneID)) %>% t
+# colnames(allCountsMat) = allCounts %>% pull(GeneID)
+# 
+# allCountsMat[1:5,1:5]
+# dim(allCountsMat)
+# 
+# hist(log10(nUMIsPerGene/nCells), 300)
+# myGenes = nUMIsPerGene/nCells>1
+# 
+# hist(log10(nUMIsPerCell)); abline(v=log10(50000))
+# keptCells = nUMIsPerCell > 50000
+# 
+# allCountsMat = allCountsMat[keptCells, myGenes]
+# rm(allCounts)
+# write_rds(allCountsMat, "allCountsMat_all.rds")
+allCountsMat = read_rds("allCountsMat_all.rds")
+```
+
+## Load barcode-experiment annotation and radial position
+```{r}
+FACSall = read_csv("FACS_bc.csv") 
+FACSall %>% pull(Experiment) %>% unique()
+
+FACSall = FACSall %>% 
+  filter(Experiment %in% c("MDA_SS_2D", "MDA_SS_3D")) %>% 
+  mutate(condition=str_replace(Experiment, "MDA_SS_", "")) %>% 
+  select(barcode, condition)
+
+FACSall =
+  left_join(
+    FACSall,
+    FACS %>% select(barcode, radialPosition))
+table(FACSall %>% pull(condition), #2D vs 3D
+      !is.na(FACSall %>% pull(radialPosition))) #radial position known?
+
+UMIvsExp = tibble(nUMIsPerCell = apply(allCountsMat, 1, sum),
+                  barcode = rownames(allCountsMat)) %>% 
+  inner_join(FACSall)
+
+ggplot(UMIvsExp) +
+  geom_density(aes(x=nUMIsPerCell, group=condition, color=condition))
+
+UMIdepth = UMIvsExp %>% pull(nUMIsPerCell) %>% median
+
+allTPMsMat = apply(allCountsMat, 1, function(x) {
+  log10(x/sum(x) + 1/UMIdepth)
+}) %>% t
+allTPMsMat[1:5,1:5]
+dim(allTPMsMat)
+
+dudi1 = dudi.pca(allTPMsMat, center=T, scale=F, scannf=F, nf=10)
+# totVar = apply(allTPMsMat, 2, var) %>% sum
+barplot(dudi1$eig[1:10] / sum(dudi1$eig))
+
+scatterT = dudi1$li %>% as_tibble() %>% 
+  mutate(barcode=rownames(allTPMsMat)) %>% relocate(barcode) %>% 
+  inner_join(FACSall)
+scatterT %>% ggplot(aes(x=Axis1, y=Axis2, color=condition)) + geom_point()
+scatterT %>% 
+  mutate(radialPosition=ifelse(condition == "2D", 1, radialPosition)) %>%
+  ggplot(aes(x=Axis1, y=Axis2, color=radialPosition)) + geom_point()
+# unclear 2D - radialPosition association using all cells PC
+
+```
+## joint projection using on 3D culture as reference
+
+```{r}
+c3Dbcs = FACSall %>% filter(condition == "3D") %>% 
+  drop_na %>% 
+  pull(barcode) %>% 
+  intersect(rownames(allTPMsMat))
+allTPMsMat[1:5,1:5]
+
+dudi2 = dudi.pca(allTPMsMat[c3Dbcs,], center=T, scale=F, scannf=F, nf=10)
+# totVar = apply(allTPMsMat, 2, var) %>% sum
+barplot(dudi2$eig[1:10] / sum(dudi2$eig))
+tibble(pctVarExpl=100 * dudi2$eig[1:10] / sum(dudi2$eig), 
+       PC=1:10) %>% 
+  ggplot(aes(x=PC, y=pctVarExpl)) +
+  geom_col() +
+  labs(x="PC", y="% variance explained")
+ggsave("PCA_explVar.pdf", height=2, width=2)
+
+dudi2$eig[1:10]
+dudi2$eig[1]/ dudi2$eig[2]
+
+dudi2$co %>% dim
+geneMeans3D = apply(allTPMsMat[c3Dbcs,], 2, mean)
+# geneSD3D = apply(allTPMsMat[c3Dbcs,], 2, sd) + 1e-3
+
+#test projecting 3D culture a la manno
+allTPMsMat0 = apply(rbind(geneMeans3D, allTPMsMat[c3Dbcs,]), 2, function(x) {
+  (x - x[1]) #/ x[2]
+})
+allTPMsMat0[1:5,1:5]
+# sum(is.infinite(allTPMsMat0))
+plot(as.matrix(allTPMsMat0[-1,]) %*% as.matrix(dudi2$c1[,1:2]))
+plot(dudi2$li[,1:2])
+
+#now project 2D and 3D cells
+allTPMsMat0 = apply(rbind(geneMeans3D, allTPMsMat), 2, function(x) {
+  (x - x[1]) #/ x[2]
+})
+plot(as.matrix(allTPMsMat0[-1,]) %*% as.matrix(dudi2$c1[,1:3]))
+
+li = as.matrix(allTPMsMat0[-1,]) %*% as.matrix(dudi2$c1[,1:3])
+xlims = range(li[,1]) #; ylims = range(li[,2])
+# dim(li)
+scatterT = li %>% as_tibble() %>% 
+  mutate(barcode=rownames(li)) %>% relocate(barcode) %>% 
+  rename(Axis1=CS1, Axis2=CS2, Axis3=CS3) %>% 
+  inner_join(FACSall)
+scatterT %>% sample_n(nrow(.)) %>% 
+  ggplot(aes(x=Axis1, y=Axis2, color=condition)) + 
+  geom_point() + labs(x="PC1", y="PC2") +
+  facet_wrap(~condition)
+ggsave("PCA_2Dvs3D_byCondition.pdf", height=3, width=8)
+
+scatterT %>% 
+  mutate(radialPosition=ifelse(condition == "2D", 1, radialPosition)) %>%
+  # filter(condition == "2D")
+  ggplot(aes(x=Axis1, y=Axis2, color=radialPosition, shape=condition)) + 
+  geom_point() + labs(x="PC1", y="PC2") #+ facet_wrap(~condition)
+# unclear 2D - radialPosition association using all cells PC
+ggsave("PCA_2Dvs3D.pdf", height=3, width=5)
+
+scatterT %>% 
+  mutate(radialPosition=ifelse(condition == "2D", 1, radialPosition)) %>%
+  filter(condition == "3D") %>% 
+  filter(Axis1<15, abs(Axis2)<10) %>% 
+  ggplot(aes(x=Axis1, y=radialPosition)) +
+  geom_smooth() +
+  xlim(xlims) + labs(x="PC1")
+ggsave("PCA_Axis1_vs_radialPos.pdf", height=2, width=5)
+
+scatterT %>% 
+  mutate(radialPosition=ifelse(condition == "2D", 1, radialPosition)) %>%
+  filter(condition == "3D") %>% 
+  # filter(Axis1<15, abs(Axis2)<10) %>% 
+  ggplot(aes(y=Axis1, x=radialPosition)) +
+  geom_smooth() + labs(x="radial position", y="PC1")
+ggsave("PCA_radialPos_vs_Axis1.pdf", height=1.5, width=1.5)
+
+
+```
+## pathway enrichment of PC1 and 2D over 3D
+
+```{r}
+# PC1gostRes =
+#   list(low=rownames(dudi2$c1)[order(dudi2$c1[,1])], #low on PC1
+#        high=rownames(dudi2$c1)[rev(order(dudi2$c1[,1]))]) %>% #high on PC1
+#   map(function(tGenes) {
+#     gostRes =
+#       gost(query=tGenes,
+#            ordered_query = T, organism = "hsapiens",
+#            significant = F,
+#            custom_bg = rownames(dudi2$c1),
+#            # custom_bg = allIntcptSlopes %>% pull(gene),
+#            # custom_bg = genesBySGEP %>% pull(gene),
+#            domain_scope = "custom")
+#     # gostplot(gostRes, capped = TRUE, interactive = TRUE)
+#     return(gostRes$result)
+#   })
+# names(PC1gostRes) = c("low", "high")
+# write_rds(PC1gostRes, "PC1gostRes.rds")
+PC1gostRes = read_rds("PC1gostRes.rds")
+
+# same for 2D vs 3D
+condV =
+  tibble(barcode=rownames(allTPMsMat)) %>% 
+  left_join(FACSall) %>% 
+  pull(condition)
+# combCells = function(log10tpms) {
+#   #log10tpms = log10(x/sum(x) + 1/UMIdepth)
+#   log10( mean(10^log10tpms - 1/UMIdepth) + 1/(UMIdepth * min(table(condV))) )
+# }
+dX = 
+  allTPMsMat[!is.na(condV) & condV == "2D",] %>% apply(2, mean) - 
+  allTPMsMat[!is.na(condV) & condV == "3D",] %>% apply(2, mean)
+
+# c2Dvs3DgostRes =
+#   list(in2D=names(rev(sort(dX))), #high in 2D
+#        in3D=names(sort(dX))) %>% #high in 3D
+#   map(function(tGenes) {
+#     gostRes =
+#       gost(query=tGenes,
+#            ordered_query = T, organism = "hsapiens",
+#            significant = F,
+#            custom_bg = names(dX),
+#            # custom_bg = allIntcptSlopes %>% pull(gene),
+#            # custom_bg = genesBySGEP %>% pull(gene),
+#            domain_scope = "custom")
+#     # gostplot(gostRes, capped = TRUE, interactive = TRUE)
+#     return(gostRes$result)
+#   })
+# write_rds(c2Dvs3DgostRes, "c2Dvs3DgostRes.rds")
+c2Dvs3DgostRes = read_rds("c2Dvs3DgostRes.rds")
+
+topPathwaysL = map(names(c2Dvs3DgostRes), function(mySide) {
+  c2Dvs3DgostRes[[mySide]] %>% select(term_name, p_value, term_id, source) %>% unique() %>%
+    filter(source %in% c("CORUM", "REAC", "KEGG")) %>% arrange(p_value) %>% 
+    mutate(q=p.adjust(p_value, method="BH")) %>% 
+    filter(q<.1) %>%
+    relocate(term_name, q)
+})
+# View(topPathwaysL[[1]])
+# View(topPathwaysL[[2]])
+
+c("REAC:R-HSA-1640170", #cell cycle
+  "REAC:R-HSA-5693532", #DNA Double-Strand Break Repair
+  # "REAC:R-HSA-9633012", #bof! aa defficiency
+  "CORUM:6816", #good! ULK1-ATG13-ATG14-PIK3C3 complex - autophagy
+  "CORUM:5745", #good! PlexinA1-NRP1 complex - morphology, migration, Tran, T. S., Kolodkin, A. L. & Bharadwaj, R. Semaphorin regulation of cellular morphology. Annu. Rev. Cell Dev. Biol. 23, 263–292 (2007).
+  "REAC:R-HSA-2408557", #selenocystein synth
+  "CORUM:3028" #good! TGFb complex
+  ) %>% 
+map(function(tId) {
+  fracCC = 
+    allTPMsMat[,intersect(DBobj$geneLists[[tId]], colnames(allTPMsMat))] %>% 
+    apply(1, function(x) {sum(10^x)+1e-5})
+  
+  scatterCCT = inner_join(
+    scatterT,
+    enframe(fracCC) %>% rename(fracCC=value, barcode=name)) 
+  vFracCC = scatterCCT %>% pull(fracCC)
+  fracCCbounds = quantile(vFracCC, c(0.0, 1-.01))
+  vFracCC[vFracCC < fracCCbounds[1]] = fracCCbounds[1]
+  vFracCC[vFracCC > fracCCbounds[2]] = fracCCbounds[2]
+  
+  scatterCCT %>%
+    mutate(fracCC=vFracCC) %>% 
+    # mutate(radialPosition=ifelse(condition == "2D", 1, radialPosition)) %>%
+    ggplot(aes(x=Axis1, y=Axis2, color=100*fracCC, shape=condition)) + 
+    geom_point() +
+    labs(x="PC1", y="PC2", color="% of transcriptome") #+ facet_wrap(~condition)
+  ggsave(sprintf("PCA_2Dvs3D_%s.pdf", tId), height=3, width=5)
+})
+
+```
+
+## plot morpho/migr vs cell cycle
+```{r}
+fracCC1 = #cell cycle
+  allTPMsMat[,intersect(unique(c(
+    DBobj$geneLists[["REAC:R-HSA-1640170"]],
+    DBobj$geneLists[["REAC:R-HSA-5693532"]])), 
+    colnames(allTPMsMat))] %>% 
+  apply(1, function(x) {sum(10^x) + 1e-5})
+fracCC2 = #morpho/migr
+  allTPMsMat[,intersect(unique(c(
+    DBobj$geneLists[["CORUM:6816"]],
+    DBobj$geneLists[["CORUM:5745"]],
+    DBobj$geneLists[["CORUM:3028"]])), 
+    colnames(allTPMsMat))] %>% 
+  apply(1, function(x) {sum(10^x) + 1e-5})
+
+scatterCCT = inner_join(
+  scatterT,
+  enframe(fracCC1) %>% rename(fracCC1=value, barcode=name)) %>% 
+  inner_join(
+    enframe(fracCC2) %>% rename(fracCC2=value, barcode=name)
+  )
+
+# vFracCC = scatterCCT %>% pull(fracCC)
+# fracCCbounds = quantile(vFracCC, c(0.0, 1-.01))
+# vFracCC[vFracCC < fracCCbounds[1]] = fracCCbounds[1]
+# vFracCC[vFracCC > fracCCbounds[2]] = fracCCbounds[2]
+  
+scatterCCT %>%
+  # mutate(fracCC=vFracCC) %>% 
+  mutate(radialPosition=ifelse(condition == "2D", 1, radialPosition)) %>% 
+  slice_sample(prop = 1) %>% 
+  # filter(condition != "2D") %>%
+  ggplot(aes(x=100*fracCC1, y=100*fracCC2, color=radialPosition, shape=condition)) +
+  geom_point() + scale_x_log10() + scale_y_log10() +
+  labs(x="Growth genes [% of transcriptome]", y="Survival genes [% of transcriptome]")
+ggsave("growthVsSurvivalGenes.pdf", height=3, width=4)
+```
+
+
+# Compare gene expression of patients and 3D-grown cells
+
+## Load and filter genes and cells
+```{r}
+# allCounts = read_tsv("countMatrix.tsv")
+# dim(allCounts)
+# allGeneNames = allCounts %>% pull("GeneID")
+# nUMIsPerGene = apply(allCounts %>% select(-GeneID), 1, sum) #UMIs per gene
+# nCells = ncol(allCounts)
+# nUMIsPerCell = apply(allCounts %>% select(-GeneID), 2, sum) #UMIs per cell
+# 
+# allCountsMat = as.matrix(allCounts %>% select(-GeneID)) %>% t
+# colnames(allCountsMat) = allCounts %>% pull(GeneID)
+# 
+# allCountsMat[1:5,1:5]
+# dim(allCountsMat)
+# 
+# hist(log10(nUMIsPerGene/nCells), 300)
+# myGenes = nUMIsPerGene/nCells>1
+# 
+# hist(log10(nUMIsPerCell)); abline(v=log10(50000))
+# keptCells = nUMIsPerCell > 50000
+# 
+# allCountsMat = allCountsMat[keptCells, myGenes]
+# rm(allCounts)
+# write_rds(allCountsMat, "allCountsMat_all.rds")
+allCountsMat = read_rds("allCountsMat_all.rds")
+```
+
+## Load barcode-experiment annotation and radial position
+```{r}
+FACSall = read_csv("FACS_bc.csv") 
+FACSall %>% pull(Experiment) %>% unique()
+
+FACSall = FACSall %>% 
+  filter(Experiment %in% c("MDA_SS_2D", "MDA_SS_3D")) %>% 
+  mutate(condition=str_replace(Experiment, "MDA_SS_", "")) %>% 
+  select(barcode, condition)
+
+FACSall =
+  left_join(
+    FACSall,
+    FACS %>% select(barcode, radialPosition))
+table(FACSall %>% pull(condition), #2D vs 3D
+      !is.na(FACSall %>% pull(radialPosition))) #radial position known?
+
+UMIvsExp = tibble(nUMIsPerCell = apply(allCountsMat, 1, sum),
+                  barcode = rownames(allCountsMat)) %>% 
+  inner_join(FACSall)
+# same number of UMIs in 2D vs 3D
+ggplot(UMIvsExp) + geom_density(aes(x=nUMIsPerCell, group=condition, color=condition))
+
+UMIdepth = UMIvsExp %>% pull(nUMIsPerCell) %>% median
+
+allTPMsMat = apply(allCountsMat, 1, function(x) {
+  log10(x/sum(x) + 1/UMIdepth)
+}) %>% t
+allTPMsMat[1:5,1:5]
+dim(allTPMsMat)
+```
+
+```{r}
+allCountsMat = read_rds("allCountsMat_all.rds") #has only good genes and cells
+c2Dbcs = FACSall %>% filter(condition == "2D") %>% 
+  # drop_na %>% 
+  pull(barcode) %>% 
+  intersect(rownames(allTPMsMat))
+c3Dbcs = FACSall %>% filter(condition == "3D") %>% 
+  drop_na %>% 
+  pull(barcode) %>% 
+  intersect(rownames(allTPMsMat))
+rm(allTPMsMat)
+```
+
+
+```{r}
+# wuUMIs = read_csv("/srv/mfs/hausserlab/data/GRINT/Wu2021Breast/SC/wu2021_BC_cancer_expression.csv")
+# wuUMIs = wuUMIs %>% 
+#   mutate(sample=str_replace(barcode, "^.*_", "")) %>% 
+#   relocate(sample)
+# write_rds(wuUMIs, "wuUMIs.rds")
+wuUMIs = read_rds("wuUMIs.rds")
+dim(wuUMIs)
+wuUMIs = wuUMIs %>% 
+  filter(sample %in% names(which((wuUMIs %>% pull(sample) %>% table) > 100)))
+(wuUMIs %>% pull(sample) %>% table)
+
+#UMIs per cell - keep only cells with ~10k UMIs
+wuUMIsPerCell = wuUMIs %>% select(-barcode, -sample) %>% as.matrix %>% apply(1, sum)
+hist(log10( wuUMIsPerCell ), 100)
+wuUMIs = wuUMIs[log10(wuUMIsPerCell) > 3.5 & log10(wuUMIsPerCell) < 4.5,]
+
+wuUMIsPerGene = wuUMIs %>% select(-barcode, -sample) %>% as.matrix %>% apply(2, sum)
+hist( log10(wuUMIsPerGene / nrow(wuUMIs)), 200)
+
+notSuperRareGenes = 
+  ((wuUMIsPerGene / nrow(wuUMIs)) > 1/100) %>% 
+  which %>% names
+
+# wuUMIs = wuUMIs %>% 
+#   select(-barcode, -sample) %>% 
+#   .[,(wuUMIsPerGene / nrow(wuUMIs)) > 1/100] %>% 
+#   mutate(sample=wuUMIs %>% pull(sample)) %>% relocate(sample)
+# wuUMIs[1:5,1:5]
+
+commonGenes = intersect(notSuperRareGenes, colnames(allCountsMat))
+
+medUMIsPerCell = wuUMIs[,commonGenes] %>% 
+  # select(-sample, -barcode) %>% 
+  as.matrix %>% apply(1, sum) %>% median
+wuLogTPMs = 
+  wuUMIs %>% 
+  filter(sample %in% c("CID4513", "CID44991")) %>% 
+  select(-sample, -barcode) %>% 
+  .[,commonGenes] %>% 
+  apply(1, function(x) { log10(x / sum(x) + 1/medUMIsPerCell) }) %>% 
+  t #%>% .[,notSuperRareGenes]
+dim(wuLogTPMs)
+wuLogTPMs[1:5,1:5]
+
+
+allTPMsMat = apply(allCountsMat[,commonGenes], 1, function(x) {
+  # log10(x/sum(x) + 1/medUMIsPerCell)
+  log10(round(medUMIsPerCell * x/sum(x)) / medUMIsPerCell + 1/medUMIsPerCell)
+}) %>% t
+allTPMsMat[1:5,1:5]
+
+```
+## DEPRECATED joint projection using on 3D culture as reference
+
+Intersect with SS3 and compute PCA
+```{r}
+# Try 1st PCA with both datasets
+dim(allTPMsMat[c3Dbcs, commonGenes])
+dim(wuLogTPMs[,commonGenes])
+dudi3 = dudi.pca(
+  rbind(allTPMsMat[c3Dbcs, commonGenes],
+        wuLogTPMs[,commonGenes]),
+  scannf=F, nf=3, scale=F, center=T)
+plot(dudi3$eig[1:30] / sum(dudi3$eig))
+plot(dudi3$li[,1:2]) #PCA separates two datasets; nice overlap on PC2!
+
+
+dudi2 = dudi.pca(allTPMsMat[c3Dbcs,commonGenes], center=T, scale=F, scannf=F, nf=10)
+# barplot(dudi2$eig[1:10] / sum(dudi2$eig))
+tibble(pctVarExpl=100 * dudi2$eig[1:10] / sum(dudi2$eig),
+       PC=1:10) %>%
+  ggplot(aes(x=PC, y=pctVarExpl)) +
+  geom_col() +
+  labs(x="PC", y="% variance explained")
+# ggsave("PCA_explVar.pdf", height=2, width=2)
+  
+# dudi2$eig[1:10]
+# dudi2$co %>% dim
+geneMeans3D = apply(allTPMsMat[c3Dbcs,commonGenes], 2, mean)
+
+#test projecting 3D culture a la manno
+allTPMsMat0 = apply(rbind(geneMeans3D, allTPMsMat[c3Dbcs,commonGenes]), 2, function(x) {
+  (x - x[1]) #/ x[2]
+})
+allTPMsMat0[1:5,1:5]
+# sum(is.infinite(allTPMsMat0))
+plot(as.matrix(allTPMsMat0[-1,]) %*% as.matrix(dudi2$c1[,1:2]))
+plot(dudi2$li[,1:2])
+
+
+
+#now project 2D and 3D cells
+allTPMsMat0 = 
+  apply(
+    rbind(geneMeans3D, allTPMsMat[c3Dbcs, commonGenes]) %>% 
+      rbind(wuLogTPMs[,commonGenes]), 2, function(x) {
+  (x - x[1]) #/ x[2]
+})
+# plot(as.matrix(allTPMsMat0[-1,]) %*% as.matrix(dudi2$c1[,1:3]))
+
+wuUMIs %>% 
+  filter(sample %in% c("CID4513", "CID44991")) %>%
+  pull(sample) %>% table
+
+li = as.matrix(allTPMsMat0[-1,]) %*% as.matrix(dudi2$c1[,1:3])
+xlims = range(li[,1]) #; ylims = range(li[,2])
+# dim(li)
+scatterT = li %>% as_tibble() %>% 
+  mutate(
+    sample=c(
+      rep("3D", nrow(allTPMsMat[c3Dbcs,commonGenes])), 
+      wuUMIs %>% filter(sample %in% c("CID4513", "CID44991")) %>% pull(sample)),
+    barcode=c(
+      rownames(allTPMsMat[c3Dbcs,]),
+      rep("NA", nrow(wuUMIs %>% filter(sample %in% c("CID4513", "CID44991"))))
+    )
+  ) %>% 
+  relocate(barcode) %>% 
+  rename(Axis1=CS1, Axis2=CS2, Axis3=CS3) %>% 
+  left_join(FACSall, by="barcode")
+scatterT %>% ggplot(aes(x=Axis1, y=Axis2, color=sample)) + geom_point()
+
+scatterT %>% 
+  mutate(radialPosition=ifelse(sample != "3D", NA, radialPosition)) %>%
+  # filter(condition == "2D")
+  ggplot(aes(x=Axis1, y=Axis2, color=radialPosition, shape=sample)) + 
+  geom_point() #+ facet_wrap(~condition)
+# unclear 2D - radialPosition association using all cells PC
+ggsave("PCA_BCvs3D.pdf", height=3, width=5)
+
+scatterT %>% 
+  mutate(radialPosition=ifelse(sample != "2D", NA, radialPosition)) %>%
+  filter(sample == "3D") %>% 
+  # filter(Axis1<15, abs(Axis2)<10) %>% 
+  ggplot(aes(x=Axis1, y=radialPosition)) +
+  geom_smooth() +
+  xlim(xlims)
+ggsave("PCA_BCvs3D_Axis1_vs_radialPos.pdf", height=2, width=5)
+
+scatterT %>% 
+  mutate(radialPosition=ifelse(condition == "2D", 1, radialPosition)) %>%
+  filter(condition == "3D") %>% 
+  # filter(Axis1<15, abs(Axis2)<10) %>% 
+  ggplot(aes(y=Axis1, x=radialPosition)) +
+  geom_smooth() 
+
+```
+## joint projection on cancer cells from patient as reference
+
+### get PCA from cancer patient cells, annotate PCs
+```{r}
+
+# dudi4 = dudi.pca(wuLogTPMs, center=T, scale=F, scannf=F, nf=10)
+# write_rds(dudi4, "dudi4.rds")
+dudi4 = read_rds("dudi4.rds")
+plot(dudi4$eig[1:30] / sum(dudi4$eig))
+plot(dudi4$li[,1:2]) #PCA separates two datasets; nice overlap on PC2!
+
+biPlotGenes = 
+  c(apply(dudi4$co[,1:2], 1, function(x) { sum(x^2) }) %>% 
+      sort %>% rev %>% .[1:10] %>% names,
+    apply(dudi4$co, 1, function(x) { x[1]}) %>% sort %>% .[1:10] %>% names,
+    apply(dudi4$co, 1, function(x) { x[1]}) %>% sort %>% rev %>% .[1:10] %>% names,
+    apply(dudi4$co, 1, function(x) { x[2]}) %>% sort %>% .[1:10] %>% names,
+    apply(dudi4$co, 1, function(x) { x[2]}) %>% sort %>% rev %>% .[1:10] %>% names) %>% 
+  unique
+
+s.arrow(dudi4$co[biPlotGenes,1:2])
+
+PC=0
+mySign = 1
+# fnByPC =
+#   map(0, function(PC) { #1:2
+#     map(c(-1, 1), function(mySign) {
+#       if ( PC > 0 ) {
+#         geneT =
+#           tibble(loading=dudi4$co[,PC] * mySign,
+#                  gene=rownames(dudi4$co))
+#       } else {
+#         geneT =
+#           tibble(loading=(dudi4$co[,2] + dudi4$co[,1]) * mySign,
+#                  gene=rownames(dudi4$co))
+#       }
+#       geneT = geneT %>% arrange(desc(loading))
+# 
+#       gostRes =
+#         gost(query=geneT %>% pull(gene),
+#              ordered_query = TRUE, organism = "hsapiens",
+#              significant = F, custom_bg = rownames(dudi4$co),
+#              domain_scope = "custom")
+#       # View(gostRes$result)
+#       # gostRes$result[1:5,] %>% mutate(bla=5)
+#       # gostplot(gostRes, capped = TRUE, interactive = TRUE)
+#       gostRes$result %>%
+#         filter(source %in% c("CORUM", "REAC", "KEGG", "WP")) %>%
+#         arrange(p_value) %>%
+#         mutate(q=p.adjust(p_value, "BH")) %>%
+#         select(-parents) %>%
+#         mutate(PC=PC, sign=mySign) %>%
+#         filter(q<.1) %>%
+#         relocate(PC, sign, term_name, q, term_id)
+#     }) %>% bind_rows
+#   }) %>% bind_rows
+# write_rds(fnByPC, "fnByPC.rds")
+fnByPC = read_rds("fnByPC.rds")
+fnByPC %>% 
+  # filter(source != "HPA") %>% 
+  # select(PC, sign, term_name, p_value, source) %>% 
+  arrange(PC, sign, p_value) %>% 
+  relocate(PC, sign, term_name, q, term_id) %>% 
+  # filter(PC==2, sign==1) %>% 
+  filter(intersection_size>=10,q<.1) %>% 
+  View 
+
+fnByPC %>% 
+  # filter(source != "HPA") %>% 
+  # select(PC, sign, term_name, p_value, source) %>% 
+  arrange(PC, sign, p_value) %>% 
+  relocate(PC, sign, term_name, q, term_id) %>% 
+  write_csv("fnByPC.csv")
+
+#PC1
+#neg: cell cycle, splicing, mRNA processing, respiration, DNA replication
+#pos: translation, lysozome, aerobic glyolysis
+#PC2
+#neg: extracellular exosome, Proteasome, oxphos, Translation, Hh mutants abrogate ligand secretion, hh synthesis
+#pos: TGF beta signaling pathway, Role of hypoxia angiogenesis and FGF pathway in OA chondrocyte hypertrophy, NFAT-JUN-FOS DNA-protein complex
+
+
+geneMeans3D = apply(wuLogTPMs, 2, mean)
+
+#now project 2D and 3D cells
+allTPMsMat0 = 
+  apply(
+    # rbind(geneMeans3D, allTPMsMat[c3Dbcs, commonGenes]) %>%
+    rbind(geneMeans3D, 
+          allTPMsMat[c(c2Dbcs, c3Dbcs),]) %>% 
+      rbind(wuLogTPMs), 2, function(x) {
+  (x - x[1]) #/ x[2]
+})
+# plot(as.matrix(allTPMsMat0[-1,]) %*% as.matrix(dudi2$c1[,1:3]))
+
+wuUMIs %>% 
+  filter(sample %in% c("CID4513", "CID44991")) %>%
+  pull(sample) %>% table
+
+li = as.matrix(allTPMsMat0[-1,]) %*% as.matrix(dudi4$c1[,1:3])
+xlims = range(li[,1]) #; ylims = range(li[,2])
+# dim(li)
+scatterT = 
+  li %>% 
+  as_tibble() %>% 
+  mutate(
+    sample=c(
+      rep("2D", nrow(allTPMsMat[c2Dbcs,])), 
+      rep("3D", nrow(allTPMsMat[c3Dbcs,])), 
+      wuUMIs %>% filter(sample %in% c("CID4513", "CID44991")) %>% pull(sample)),
+    barcode=c(
+      rep("NA", nrow(allTPMsMat[c2Dbcs,])),
+      rownames(allTPMsMat[c3Dbcs,]),
+      rep("NA", nrow(wuUMIs %>% filter(sample %in% c("CID4513", "CID44991"))))
+    )
+  ) %>% 
+  relocate(barcode) %>% 
+  rename(Axis1=CS1, Axis2=CS2, Axis3=CS3) %>% 
+  left_join(FACSall, by="barcode")
+
+scatterT %>% 
+  mutate(rnd=runif(nrow(scatterT))) %>% arrange(rnd) %>% 
+  mutate(sample=ifelse(sample=="CID44991", "tumor", sample)) %>% 
+  ggplot(aes(x=Axis1, y=Axis2, color=sample)) + 
+  geom_point(alpha=.5) +
+  labs(x="PC1", y="PC2")
+ggsave("PCA_BCvs3Dvs2D.pdf", height=2.5, width=2.5*5/3.5)
+
+# scatterT %>% 
+#   mutate(radialPosition=ifelse(sample != "3D", NA, radialPosition)) %>%
+#   # filter(condition == "2D")
+#   ggplot(aes(x=Axis1, y=Axis2, color=radialPosition, shape=sample)) + 
+#   geom_point() #+ facet_wrap(~condition)
+# # unclear 2D - radialPosition association using all cells PC
+# ggsave("PCA_BCvs3D.pdf", height=3, width=5)
+# 
+# scatterT %>% 
+#   mutate(radialPosition=ifelse(sample != "2D", NA, radialPosition)) %>%
+#   filter(sample == "3D") %>% 
+#   # filter(Axis1<15, abs(Axis2)<10) %>% 
+#   ggplot(aes(x=Axis1, y=radialPosition)) +
+#   geom_smooth() +
+#   xlim(xlims)
+# ggsave("PCA_BCvs3D_Axis1_vs_radialPos.pdf", height=2, width=5)
+# 
+# scatterT %>% 
+#   mutate(radialPosition=ifelse(condition == "2D", 1, radialPosition)) %>%
+#   filter(condition == "3D") %>% 
+#   # filter(Axis1<15, abs(Axis2)<10) %>% 
+#   ggplot(aes(y=Axis1, x=radialPosition)) +
+#   geom_smooth() 
+```
+
+## what genes are missing in 3D that are found in tumors in vivo?
+```{r}
+dX = 
+  ( wuLogTPMs %>% apply(2, mean) ) - 
+  ( allTPMsMat[c3Dbcs,] %>% apply(2, mean) )
+
+tGenes = names(rev(sort(dX)))
+# cIVvs3DgostRes =
+#   list(inVivo=names(rev(sort(dX))), #high in vivo
+#        in3D=names(sort(dX))) %>% #high in 3D
+#   map(function(tGenes) {
+#     gostRes =
+#       gost(query=tGenes,
+#            ordered_query = T, organism = "hsapiens",
+#            significant = F,
+#            custom_bg = tGenes,
+#            # custom_bg = allIntcptSlopes %>% pull(gene),
+#            # custom_bg = genesBySGEP %>% pull(gene),
+#            domain_scope = "custom")
+#     # gostplot(gostRes, capped = TRUE, interactive = TRUE)
+#     return(gostRes$result)
+#   })
+# write_rds(cIVvs3DgostRes, "cIVvs3DgostRes.rds")
+
+cIVvs3DgostRes = read_rds("cIVvs3DgostRes.rds")
+
+
+topPathwaysL = map(names(cIVvs3DgostRes), function(mySide) {
+  cIVvs3DgostRes[[mySide]] %>% select(term_name, p_value, term_id, source) %>% unique() %>%
+    filter(source %in% c("CORUM", "REAC", "KEGG", "WP")) %>% arrange(p_value) %>% 
+    mutate(q=p.adjust(p_value, method="BH")) %>% 
+    filter(q<.1) %>%
+    relocate(term_name, q)
+})
+names(topPathwaysL) = names(cIVvs3DgostRes)
+# View(topPathwaysL[[1]])
+# View(topPathwaysL[[2]])
+
+
+# c( #OLD SELECTION BASED ON DIFF GENE EXPR IN 3D VS IN VIVO
+#   ## in spheroids:
+#   "REAC:R-HSA-9711097", #starvation
+#   "CORUM:306", #ribosome
+#   ## in vivo:
+#   # "WP:WP2446", #no: Retinoblastoma gene in cancer
+#   # "WP:WP411", #no: mRNA processing
+#   # "REAC:R-HSA-1640170", #no: Cell cycle
+#   # "WP:WP2446", #bad
+#   # "CORUM:351", #bad
+#   # "WP:WP411", #bad
+#   # "WP:WP4016", #bad
+#   # "WP:WP111", #good- Electron transport chain OXPHOS system in mitochondria
+#   # "KEGG:04714", #bof
+#   # "KEGG:05208", #bad
+#   # "CORUM:178", #good- respiratory chain; but WP111/REAC:611105 is better
+#   "REAC:R-HSA-191273", #ok- cholesterol biosynth
+#   "CORUM:2695", #maybe- fos-jun complex
+#   "REAC:R-HSA-611105" #good- respiratory electron transport
+#   ) %>% 
+# c(
+#   ## in spheroids:
+#   "WP:WP183", #Proteasome degradation ###
+#   "REAC:R-HSA-169911", #Regulation of Apoptosis ###
+#   "REAC:R-HSA-5358346", #Hedgehog ligand biogenesis ###
+#   "REAC:R-HSA-1236975", #Antigen processing-Cross presentation ###
+#   "REAC:R-HSA-1234174", #Cellular response to hypoxia ###
+# 
+#   ## in vivo:
+#   # "CORUM:306", #Ribosome, cytoplasmic ###
+#   # "WP:WP366", #TGF beta signaling pathway
+#   # "REAC:R-HSA-9633012", #Response of EIF2AK4 (GCN2) to amino acid deficiency ###
+#   "WP:WP5373", #Role of hypoxia angiogenesis and FGF pathway in OA chondrocyte hypertrophy ###
+#   # "WP:WP3888", #VEGFA VEGFR2 signaling ### slight but there
+#   "WP:WP2880", #Glucocorticoid receptor pathway
+#   "WP:WP437", #EGF EGFR signaling pathway
+#   # "REAC:R-HSA-2408557" #Selenocysteine synthesis ###
+# ) %>% 
+#   
+
+bind_rows(
+  inner_join(
+    topPathwaysL[["inVivo"]] %>% 
+      filter(q<.1) %>% 
+      select(term_id, q),
+    fnByPC %>% 
+      filter(q<.1) %>%
+      filter(sign==1) %>% 
+      select(term_id, term_name, q),
+    by="term_id") %>% 
+    mutate(enriched="in vivo"),
+  inner_join(
+    topPathwaysL[["in3D"]] %>% 
+      filter(q<.1) %>% 
+      select(term_id, q),
+    fnByPC %>% 
+      filter(intersection_size>=5, q<.1) %>%
+      filter(sign==-1) %>% 
+      select(term_id, term_name, q),
+    by="term_id") %>% 
+    mutate(enriched="in 3D spheroids")
+) %>% write_csv("enrichedInVivoVs3D.csv")
+
+
+
+# 
+# c(fnByPC %>% 
+#   filter(intersection_size>=10, q<.1) %>%
+#   filter(sign==1) %>% 
+#   arrange(p_value) %>% 
+#   relocate(PC, sign, term_name, q, term_id) %>% 
+#   top_n(5) %>% pull(term_id),
+#   
+#   fnByPC %>% 
+#   filter(intersection_size>=10, q<.1) %>%
+#   filter(sign==-1) %>% 
+#   arrange(p_value) %>% 
+#   relocate(PC, sign, term_name, q, term_id) %>% 
+#   top_n(5) %>% pull(term_id)
+# ) %>% 
+  
+tId = "WP:WP111"
+c("WP:WP111", "WP:WP5193", "WP:WP4752", "CORUM:2694", #in vivo
+    "CORUM:306", "REAC:R-HSA-9633012", "REAC:R-HSA-9711097", "WP:WP183", "WP:WP3888", "WP:WP534" #in 3D
+  ) %>% 
+  map(function(tId) {
+    vFracCC = 
+      #li table has cells organized like this:
+      rbind(allTPMsMat[c(c2Dbcs, c3Dbcs), ],
+            wuLogTPMs)[,intersect(DBobj$geneLists[[tId]], commonGenes)] %>% 
+      apply(1, function(x) {sum(10^x)})
+  
+    fracCCbounds = quantile(vFracCC, c(0.0, 1-.01))
+    vFracCC[vFracCC < fracCCbounds[1]] = fracCCbounds[1]
+    vFracCC[vFracCC > fracCCbounds[2]] = fracCCbounds[2]
+    
+    tName = DBobj$idNames %>% filter(id == tId) %>% pull(description)
+    
+    scatterCCT = 
+      scatterT %>% 
+      mutate(fracCC=vFracCC) %>% 
+      mutate(rnd=runif(nrow(scatterT))) %>% arrange(rnd) %>% 
+      mutate(sample=ifelse(sample=="CID44991", "tumor", sample)) %>% 
+      filter(sample!="2D") 
+  
+    scatterCCT %>% 
+      ggplot(aes(x=Axis1, y=Axis2, color=100*fracCC, shape=sample)) + 
+      geom_point() + #alpha=.5) +
+      labs(x="PC1", y="PC2", color="% of transcriptome") + #+ facet_wrap(~condition)
+      ggtitle(tName)
+    ggsave(sprintf("PCA_BCvs3D_%s.pdf", tId), height=3.5, width=5)
+  
+    scatterCCT %>% 
+      filter(sample=="tumor") %>% 
+      ggplot(aes(x=Axis1, y=Axis2, color=100*fracCC, shape=sample)) + 
+      geom_point() + #alpha=.5) +
+      labs(x="PC1", y="PC2", color="% of transcriptome") + #+ facet_wrap(~condition)
+      ggtitle(tName)
+    ggsave(sprintf("PCA_BCvs3D_justInVivo_%s.pdf", tId), height=3.5, width=5)
+  })
+```
+
+
